@@ -38,6 +38,8 @@ new-api 默认在健康渠道间**按 weight 加权随机**——每个请求可
 
 **切换策略（能不换就不换，护缓存）**：活动 key 只要 `pct < 95%` 就一直钉着；到阈值才切走，在有额度的其余 key 里挑 **用量最低（剩余最多）** 的当新活动，让它撑最久、切换最少。
 
+**周临期优先（keyrot-1，默认开）**：切换发生时，若当前档位的**合格 key**中有周窗口将在 24 小时内重置的（`weekly_reset_lookahead_hours` 配置，0 = 关闭），优先选它——多把临期按重置时刻升序（EDF）。正常档仍只用 `<95%`；只有全部 key 都越过 95% 进入降级档后，才继续使用 `<100%` 的 key。临期只改变安全候选内部顺序，不放宽 95% 预防线。
+
 ## 快速开始
 
 ```bash
@@ -55,6 +57,64 @@ cargo run --release -- up config.toml  # 起 new-api + 建渠道 + 进入切换�
 | `down` | 停掉本工具托管的 new-api |
 
 数据（SQLite / 二进制 / 日志 / PID）都在 `./.newapi/`。日志级别用 `RUST_LOG` 控制。
+
+## Key 配置与重载（日常操作）
+
+**没有热加载**：`config.toml` 只在启动时读一次，改完必须重启循环。看板上的加/删 key 是例外（走运行时命令通道，自动写回 config，不用重启）。
+
+### config.toml 里每把 key 长什么样
+
+```toml
+[[keys]]
+name = "zhipu-1"                                    # 同时用作唯一的上游渠道名
+zhipu_api_key = "xxxxxxxx.yyyyyyyy"                 # 智谱编程套餐页建的 key（长串、中间一个点）
+[[keys.quota_headers]]                              # 团体套餐必需的 selector（个人套餐删掉这两段）
+key = "Bigmodel-Organization"
+value = "org-..."
+[[keys.quota_headers]]
+key = "Bigmodel-Project"
+value = "proj_..."
+```
+
+每把上游 key 只建一个 Custom(type 8) 渠道。NewAPI 原生同时接收 OpenAI 与 Anthropic
+下游请求，并把两种格式都转换后送进这同一条渠道，因此下游协议不会复制渠道或调度状态。
+
+### org / project 的值在智谱网页上怎么取（每把 key 配一次）
+
+`quota_headers` 里的两个 selector 决定**查的是哪个团队的额度**，必须在智谱网页上用 F12 抄：
+
+1. 浏览器登录 [bigmodel.cn](https://bigmodel.cn)，打开 `https://bigmodel.cn/coding-plan/team/usage-stats`
+2. ⚠️ **先在页面上把团队/组织切到这把 key 所属的那个**——账号属多个团队时，切错了抄到的就是别家的 org/project（照样能查通，但查的是别家的额度，调度全乱）
+3. 按 **F12**（或右键 → 检查）→ 顶部切到 **Network / 网络** 标签 → 按 **F5** 刷新页面
+4. 在 Network 的过滤框输入 `quota`，点击列表里名为 `quota/limit` 的那条请求
+5. 右侧选 **Headers / 标头** → 往下翻到 **Request Headers / 请求标头**，找到这两行，抄引号里的值：
+   - `Bigmodel-Organization: org-xxxxxxxx` → 填到第一条 `[[keys.quota_headers]]` 的 `value`
+   - `Bigmodel-Project: proj_xxxxxxxx` → 填到第二条的 `value`
+6. **每把 key 各抄各的**（不同 key 可能属不同团队/项目，回到第 2 步换团队上下文再抄一遍）
+
+为什么这步不能省：团队套餐缺 selector 时智谱**不报错**，只是安静地返回空 `limits`——那把 key 会被误判成「查询失败」，永远不参与调度（好在本工具启动探活会把它挡下来并明说）。原理详见下面「三个必须知道的坑」第 1 条。
+
+### 重载方法（改完 config.toml 后）
+
+```bash
+pkill -f 'quota-throttle up'
+nohup ./target/release/quota-throttle up config.toml >> .newapi/quota-throttle.log 2>&1 &
+tail -f .newapi/quota-throttle.log     # 看它起来后的渠道映射与首轮决策
+```
+
+`up` 幂等：已存在的渠道对账模型目录，缺失的补建。
+
+### 三种 key 变更
+
+| 场景 | 步骤 |
+|------|------|
+| **新增 key** | config 加一条 `[[keys]]` → 重载。sync 自动建渠道、纳入调度 |
+| **替换同名 key 的值**（换新 key 但沿用名字） | ⚠️ **sync 按名幂等，不会更新已存在渠道里的旧 key！** 除了改 config + 重载，还须更新渠道里的 key：new-api 管理页（`http://127.0.0.1:3000`，登录后 渠道 → 编辑 `zhipu-N` → 粘贴新 key），或直写 SQLite `UPDATE channels SET key='<新key>' WHERE name='zhipu-N';` |
+| **移除 key** | config 删掉那条 `[[keys]]` → 重载。**new-api 渠道会留下来**（保历史用量）且不再被管理——它会出现在看板「野生渠道」区，务必把它的 priority 压到 0（否则 429 兜底时可能把流量漏给一把你不想要的 key）。更省事的做法：直接在看板卡片上点「✕ 停止调度」（自动压 priority + 写回 config，一步到位） |
+
+### 常驻运行
+
+`up` 循环建议用 `nohup` 脱离终端跑（上面的重载命令即是）。它**不会开机自启**；停它用 `pkill -f 'quota-throttle up'`（new-api 是独立进程，不受影响；`down` 子命令才是停 new-api）。
 
 ## 状态看板
 
@@ -88,7 +148,7 @@ cargo run --release -- up config.toml  # 起 new-api + 建渠道 + 进入切换�
 
 依据：[coding-plan/faq](https://docs.bigmodel.cn/cn/coding-plan/faq) + [coding-plan/overview](https://docs.bigmodel.cn/cn/coding-plan/overview)。
 
-## ⚠️ 三个必须知道的坑（都是踩出来的）
+## ⚠️ 接入要点（都是踩出来的）
 
 ### 1. 团体套餐读用量：三个条件缺一不可
 
@@ -115,7 +175,18 @@ Bigmodel-Project: proj_...
 [new_api.channel_template]
 type = 8
 base_url = "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
+models = "glm-4.5,glm-4.5-air,glm-4.6,glm-4.7,glm-5,glm-5-turbo,glm-5.1,glm-5.2,glm-5.3,glm-5.3-flash" # 探测失败时 fallback
+group = "default"
+
+[new_api.channel_template.model_discovery]
+url = "https://open.bigmodel.cn/api/coding/paas/v4/models"
+auth = "bearer"
 ```
+
+`up` / `sync` 会用每把 key 调一次 `/models`：新渠道采用实时结果，存量渠道发生增删时只更新
+`models`；探测失败不会改存量渠道，新建渠道才使用上面的 fallback。该探测不进入 quota 或看板
+轮询。旧智谱 Coding 配置即使没有 `model_discovery` 子表，也会自动补官方端点；其它 Custom
+上游不会被猜测。
 
 ### 3. opencode 接入：改 provider 的 baseURL，并清掉 auth.json 里的智谱 key
 
@@ -138,7 +209,22 @@ opencode 的 `zhipuai-coding-plan` 是 **OpenAI 兼容** provider（`@ai-sdk/ope
 
 **同时要把 `~/.local/share/opencode/auth.json` 里的 `zhipuai-coding-plan` 条目清掉**（备份后置空即可）——否则 opencode 可能优先用 auth.json 里的智谱 key 去连 new-api，被拒 401。
 
-**模型名**只能用 opencode 该 provider 的这几个：`glm-4.7` `glm-5.1` `glm-5.2` `glm-5-turbo` `glm-5v-turbo` `glm-4.6v` `glm-4.5-air`（**没有 `glm-4.6`**）。
+**模型名以当前 key 的 `/models` 返回为准**。运行 `sync` 后，new-api 渠道会自动收敛到该 key
+实际可用的集合；客户端自己的 provider 注册表若尚未展示新模型，可在客户端配置中显式补充。
+
+### 4. Claude Code 接入：复用同一把 NewAPI key
+
+NewAPI v1.0.0-rc.20 原生提供 `/v1/messages`，现有 Custom(type 8) 渠道会把 Anthropic 请求
+转换成 OpenAI 兼容请求，再发往智谱 Coding Plan。因此无需 `-cc` 渠道、额外 group 或
+Claude 专用令牌：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:3000
+export ANTHROPIC_AUTH_TOKEN='<opencode 正在使用的同一把 NewAPI key>'
+```
+
+2026-08-30 实测同一 key 可完成普通及流式 `/v1/messages` 请求，包含 `tools` 与
+`cache_control` 字段；两种下游协议自然共享同一活动渠道和 priority。
 
 ## 设计要点
 

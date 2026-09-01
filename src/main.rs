@@ -1,5 +1,6 @@
 mod boot;
 mod config;
+mod model_catalog;
 mod newapi;
 mod orchestrator;
 mod quota;
@@ -7,7 +8,7 @@ mod status;
 
 use crate::boot::NewApiProcess;
 use crate::config::{Config, ResolvedKey};
-use crate::newapi::NewApiClient;
+use crate::newapi::{NewApiClient, SyncOutcome};
 use crate::orchestrator::Orchestrator;
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -105,14 +106,15 @@ async fn cmd_sync(cfg: Config) -> Result<()> {
     ensure_newapi_up(&cfg).await?;
     let mut api = NewApiClient::new(&cfg.new_api)?;
     api.authenticate().await?;
-    let map = api
+    let outcome = api
         .sync_channels(
             &cfg.keys,
             cfg.new_api.channel_template.as_ref(),
             cfg.priority_standby,
         )
         .await?;
-    print_mapping(&cfg, &map);
+    print_mapping(&cfg, &outcome);
+    print_downstream_access(&cfg);
     Ok(())
 }
 
@@ -120,14 +122,14 @@ async fn cmd_up(cfg: Config) -> Result<()> {
     ensure_newapi_up(&cfg).await?;
     let mut api = NewApiClient::new(&cfg.new_api)?;
     api.authenticate().await?;
-    let map = api
+    let outcome = api
         .sync_channels(
             &cfg.keys,
             cfg.new_api.channel_template.as_ref(),
             cfg.priority_standby,
         )
         .await?;
-    let keys = resolve_keys(&cfg, &map);
+    let keys = resolve_keys(&cfg, &outcome.primary);
     run_loop(cfg, api, keys).await
 }
 
@@ -141,16 +143,29 @@ async fn cmd_run(cfg: Config) -> Result<()> {
     run_loop(cfg, api, keys).await
 }
 
-/// 把 config.keys + (name→id 映射) 解析成 orchestrator 用的 ResolvedKey。
-/// 优先用 config 里显式写的 channel_id，否则按 name 从映射里取。
-fn resolve_keys(cfg: &Config, map: &HashMap<String, i64>) -> Vec<ResolvedKey> {
+/// NewAPI 原生同时接收 OpenAI 与 Anthropic 下游格式；两者复用现有访问 key、group 和渠道。
+fn print_downstream_access(cfg: &Config) {
+    let base = cfg.new_api.base_url.trim_end_matches('/');
+    info!("下游接入共用同一把 NewAPI 访问 key：");
+    info!("  OpenAI base URL: {base}/v1");
+    info!("  ANTHROPIC_BASE_URL={base}");
+    info!("  ANTHROPIC_AUTH_TOKEN=<与 OpenAI 客户端相同的 NewAPI key>");
+}
+
+/// 把 config.keys + name→id 映射解析成 orchestrator 用的 ResolvedKey。
+/// 优先用 config 里显式写的 channel_id，否则按 name 从映射里取；
+fn resolve_keys(
+    cfg: &Config,
+    primary: &HashMap<String, i64>,
+) -> Vec<ResolvedKey> {
     let mut out = Vec::new();
     for k in &cfg.keys {
-        match k.channel_id.or_else(|| map.get(&k.name).copied()) {
+        match k.channel_id.or_else(|| primary.get(&k.name).copied()) {
             Some(id) => out.push(ResolvedKey {
                 name: k.name.clone(),
                 zhipu_api_key: k.zhipu_api_key.clone(),
                 channel_id: id,
+                note: k.note.clone(),
                 quota_headers: k.quota_headers.clone(),
             }),
             None => warn!(name = %k.name, "解析不到 channel_id（既无显式配置也无同名渠道），本 key 跳过"),
@@ -159,10 +174,10 @@ fn resolve_keys(cfg: &Config, map: &HashMap<String, i64>) -> Vec<ResolvedKey> {
     out
 }
 
-fn print_mapping(cfg: &Config, map: &HashMap<String, i64>) {
+fn print_mapping(cfg: &Config, outcome: &SyncOutcome) {
     info!("渠道映射 name → channel_id：");
     for k in &cfg.keys {
-        match map.get(&k.name) {
+        match outcome.primary.get(&k.name) {
             Some(id) => info!("  {} → {}", k.name, id),
             None => warn!("  {} → (未找到)", k.name),
         }
@@ -182,6 +197,7 @@ async fn run_loop(cfg: Config, api: NewApiClient, keys: Vec<ResolvedKey>) -> Res
         keys = keys.len(),
         "进入切换循环（priority 单活动 key 模式）"
     );
+    print_downstream_access(&cfg);
 
     let api = std::sync::Arc::new(api);
 

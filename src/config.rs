@@ -48,6 +48,12 @@ pub struct Config {
     #[serde(default = "default_panel_interval")]
     pub panel_interval_secs: u64,
 
+    /// 周窗口重置进入这个时间窗（小时）内的 key 视为「临期」：切换时优先选它
+    /// （先烧快清零的额度，最大化使用效率）。0 = 关闭本策略（行为与旧版完全一致）。
+    /// 建议 6–48h；上限 7 天（周窗口最长一周，再大等于全年轮询）。
+    #[serde(default = "default_weekly_lookahead")]
+    pub weekly_reset_lookahead_hours: u64,
+
     /// 监控哪些窗口。默认同时看 5 小时和每周（取最大使用率）。
     #[serde(default = "default_windows")]
     pub watch_windows: Vec<Window>,
@@ -136,6 +142,9 @@ fn default_restore() -> f64 {
 }
 fn default_exhausted() -> f64 {
     100.0
+}
+fn default_weekly_lookahead() -> u64 {
+    24
 }
 fn default_windows() -> Vec<Window> {
     vec![Window::FiveHour, Window::Weekly]
@@ -252,6 +261,29 @@ pub struct ChannelTemplate {
     /// 分组名
     #[serde(default = "default_group")]
     pub group: String,
+    /// 可选的上游 `/models` 发现。成功结果是权威目录；`models` 仅作新建时 fallback。
+    /// 旧智谱 Coding 配置缺省此块时，`Config::load` 会自动补官方 models 端点。
+    #[serde(default)]
+    pub model_discovery: Option<ModelDiscoveryConfig>,
+}
+
+/// 上游模型目录的鉴权形态。不同 OpenAI 兼容网关并不统一：智谱用 Bearer，
+/// 火山自定义 APIG 实测使用原始 Authorization。
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDiscoveryAuth {
+    #[default]
+    Bearer,
+    AuthorizationRaw,
+    XApiKey,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash)]
+pub struct ModelDiscoveryConfig {
+    /// 完整 models URL，例如 https://open.bigmodel.cn/api/coding/paas/v4/models
+    pub url: String,
+    #[serde(default)]
+    pub auth: ModelDiscoveryAuth,
 }
 
 fn default_channel_type() -> i64 {
@@ -279,6 +311,10 @@ pub struct KeyMapping {
     #[serde(default)]
     pub channel_id: Option<i64>,
 
+    /// 人类可读的备注（如持有人名字），只在看板显示，不参与任何逻辑。留空即不显示。
+    #[serde(default)]
+    pub note: String,
+
     /// 该 key 查询用量时附加的 selector header。团体套餐必需
     /// （Bigmodel-Organization / Bigmodel-Project）——**不同 key 可能属于不同组织/项目，
     /// 故按 key 配置**。留空则回退到 [zhipu].extra_headers 的全局兜底。
@@ -292,6 +328,8 @@ pub struct ResolvedKey {
     pub name: String,
     pub zhipu_api_key: String,
     pub channel_id: i64,
+    /// 人类可读的备注（透传自 KeyMapping），只显示不参与逻辑
+    pub note: String,
     /// per-key 的用量查询 selector header（透传自 KeyMapping）
     pub quota_headers: Vec<HeaderKV>,
 }
@@ -301,6 +339,9 @@ pub struct ResolvedKey {
 pub struct NewKeySpec {
     pub name: String,
     pub api_key: String,
+    /// 人类可读备注（如持有人名字），可选
+    #[serde(default)]
+    pub note: String,
     /// 团体套餐的 selector。个人套餐留空。
     #[serde(default)]
     pub org: Option<String>,
@@ -342,6 +383,37 @@ fn write_atomic(path: &str, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_model_discovery(label: &str, cfg: Option<&ModelDiscoveryConfig>) -> anyhow::Result<()> {
+    let Some(cfg) = cfg else { return Ok(()) };
+    anyhow::ensure!(
+        !cfg.url.trim().is_empty() && cfg.url == cfg.url.trim(),
+        "{label}.model_discovery.url 非法：不能为空或带首尾空白"
+    );
+    let url = reqwest::Url::parse(&cfg.url)
+        .with_context(|| format!("{label}.model_discovery.url 不是合法绝对 URL: {}", cfg.url))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https") && url.has_host(),
+        "{label}.model_discovery.url 只允许带主机的 http/https 绝对 URL: {}",
+        cfg.url
+    );
+    Ok(())
+}
+
+/// 只对已经明确识别出的智谱 Coding Plan 模板补默认发现配置；其它 Custom 上游不猜。
+fn infer_zhipu_model_discovery(template: &ChannelTemplate) -> Option<ModelDiscoveryConfig> {
+    let url = reqwest::Url::parse(&template.base_url).ok()?;
+    if url.host_str() != Some("open.bigmodel.cn")
+        || url.path().trim_end_matches('/')
+            != "/api/coding/paas/v4/chat/completions"
+    {
+        return None;
+    }
+    Some(ModelDiscoveryConfig {
+        url: "https://open.bigmodel.cn/api/coding/paas/v4/models".to_string(),
+        auth: ModelDiscoveryAuth::Bearer,
+    })
+}
+
 /// 往 config.toml 追加一条 `[[keys]]`。
 ///
 /// 用 **toml_edit**（格式保留式编辑）而不是 `toml::to_string` 重新序列化——后者会把用户
@@ -366,6 +438,9 @@ pub fn append_key(path: &str, spec: &NewKeySpec) -> anyhow::Result<()> {
     let mut t = toml_edit::Table::new();
     t["name"] = toml_edit::value(spec.name.clone());
     t["zhipu_api_key"] = toml_edit::value(spec.api_key.clone());
+    if !spec.note.trim().is_empty() {
+        t["note"] = toml_edit::value(spec.note.trim());
+    }
     let hs = spec.headers();
     if !hs.is_empty() {
         let mut arr = toml_edit::ArrayOfTables::new();
@@ -403,6 +478,11 @@ impl Config {
         let text = std::fs::read_to_string(path)?;
         let mut cfg: Config = toml::from_str(&text)?;
         cfg.source_path = path.to_string_lossy().into_owned();
+        if let Some(template) = cfg.new_api.channel_template.as_mut() {
+            if template.model_discovery.is_none() {
+                template.model_discovery = infer_zhipu_model_discovery(template);
+            }
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -420,6 +500,12 @@ impl Config {
             r > 0.0 && r <= t && t <= e && e <= 100.0,
             "阈值非法：要求 0 < restore({r}) ≤ throttle({t}) ≤ exhausted({e}) ≤ 100"
         );
+        // 周临期时间窗：0 = 关闭；上限 7 天 = 周窗口周期（再大等于把全部 key 都算临期）
+        anyhow::ensure!(
+            self.weekly_reset_lookahead_hours <= 24 * 7,
+            "weekly_reset_lookahead_hours 非法：{}（要求 0–168；0 = 关闭临期优先，168 = 一周 = 全临期）",
+            self.weekly_reset_lookahead_hours
+        );
         if let Some(p) = &self.peak {
             anyhow::ensure!(
                 (0..=24).contains(&p.start_hour)
@@ -430,6 +516,13 @@ impl Config {
                 p.end_hour
             );
         }
+        validate_model_discovery(
+            "[new_api.channel_template]",
+            self.new_api
+                .channel_template
+                .as_ref()
+                .and_then(|t| t.model_discovery.as_ref()),
+        )?;
         Ok(())
     }
 }
@@ -469,6 +562,7 @@ value = "org-1"
         NewKeySpec {
             name: name.into(),
             api_key: "k2".into(),
+            note: String::new(),
             org: Some("org-2".into()),
             project: Some("proj-2".into()),
         }
@@ -538,6 +632,7 @@ value = "org-1"
             &NewKeySpec {
                 name: "personal".into(),
                 api_key: "k3".into(),
+                note: String::new(),
                 org: None,
                 project: Some("  ".into()), // 空白应被当作没填
             },
@@ -555,5 +650,158 @@ value = "org-1"
         std::fs::write(&p, SAMPLE.replace("throttle_threshold = 95.0", "throttle_threshold = 101.0")).unwrap();
         assert!(Config::load(&p).is_err());
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn 周临期时间窗_缺省24_填0合法_超一周失败() {
+        // 缺省 = 24（策略默认开）
+        let p = tmp("lk-default");
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(cfg.weekly_reset_lookahead_hours, 24);
+        std::fs::remove_file(&p).ok();
+
+        // 0 = 显式关闭（⚠️ 必须写在 [[keys]] 之前——TOML 里 key 归属最近的表头，
+        // 追加在 keys 表之后会被挂进 keys.quota_headers 而不是顶层）
+        let p = tmp("lk-zero");
+        std::fs::write(
+            &p,
+            SAMPLE.replace("poll_interval_secs", "weekly_reset_lookahead_hours = 0\npoll_interval_secs"),
+        )
+        .unwrap();
+        assert_eq!(Config::load(&p).unwrap().weekly_reset_lookahead_hours, 0);
+        std::fs::remove_file(&p).ok();
+
+        // 168 = 一周（上限，合法）；169 = 手误，启动即失败
+        let p = tmp("lk-max");
+        std::fs::write(
+            &p,
+            SAMPLE.replace("poll_interval_secs", "weekly_reset_lookahead_hours = 169\npoll_interval_secs"),
+        )
+        .unwrap();
+        assert!(Config::load(&p).is_err(), "169h 超过周周期，应拦截");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// SAMPLE + 追加模型发现配置，落盘后返回路径。
+    fn model_cfg(extra: &str) -> String {
+        let p = std::env::temp_dir().join(format!(
+            "qt-cfg-{}-models-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&p, format!("{SAMPLE}{extra}")).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    const OPENAI_TPL: &str = r#"
+[new_api.channel_template]
+type = 8
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
+models = "glm-5.2"
+group = "default"
+"#;
+
+    #[test]
+    fn 模型发现_旧智谱配置自动启用且鉴权默认bearer() {
+        let p = model_cfg(&format!(
+            "{OPENAI_TPL}\n[new_api.channel_template.model_discovery]\n\
+             url = \"https://open.bigmodel.cn/api/coding/paas/v4/models\"\n"
+        ));
+        let cfg = Config::load(&p).unwrap();
+        let discovery = cfg
+            .new_api
+            .channel_template
+            .as_ref()
+            .unwrap()
+            .model_discovery
+            .as_ref()
+            .unwrap();
+        assert_eq!(discovery.auth, ModelDiscoveryAuth::Bearer);
+        std::fs::remove_file(&p).ok();
+
+        let p = model_cfg(OPENAI_TPL);
+        let cfg = Config::load(&p).unwrap();
+        let inferred = cfg
+            .new_api
+            .channel_template
+            .as_ref()
+            .unwrap()
+            .model_discovery
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            inferred.url,
+            "https://open.bigmodel.cn/api/coding/paas/v4/models"
+        );
+        assert_eq!(inferred.auth, ModelDiscoveryAuth::Bearer);
+        std::fs::remove_file(&p).ok();
+
+        // 非智谱 Custom 上游缺省时保持 None，不能凭空猜鉴权和 models URL。
+        let custom = OPENAI_TPL.replace(
+            "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+            "https://gateway.example/v1/chat/completions",
+        );
+        let p = model_cfg(&custom);
+        let cfg = Config::load(&p).unwrap();
+        assert!(cfg
+            .new_api
+            .channel_template
+            .as_ref()
+            .unwrap()
+            .model_discovery
+            .is_none());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn 模型发现_支持raw与x_api_key鉴权() {
+        for (auth, expected) in [
+            ("authorization_raw", ModelDiscoveryAuth::AuthorizationRaw),
+            ("x_api_key", ModelDiscoveryAuth::XApiKey),
+        ] {
+            let p = model_cfg(&format!(
+                "{OPENAI_TPL}\n[new_api.channel_template.model_discovery]\n\
+                 url = \"https://gateway.example/v1/models\"\n\
+                 auth = \"{auth}\"\n"
+            ));
+            let cfg = Config::load(&p).unwrap();
+            assert_eq!(
+                cfg.new_api
+                    .channel_template
+                    .as_ref()
+                    .unwrap()
+                    .model_discovery
+                    .as_ref()
+                    .unwrap()
+                    .auth,
+                expected
+            );
+            std::fs::remove_file(&p).ok();
+        }
+    }
+
+    #[test]
+    fn 模型发现_非法url启动即失败() {
+        for url in ["models", "file:///tmp/models", " https://example/models"] {
+            let p = model_cfg(&format!(
+                "{OPENAI_TPL}\n[new_api.channel_template.model_discovery]\nurl = \"{url}\"\n"
+            ));
+            assert!(Config::load(&p).is_err(), "应拒绝 URL: {url}");
+            std::fs::remove_file(&p).ok();
+        }
+    }
+
+    #[test]
+    fn 示例配置可解析且默认开启智谱模型发现() {
+        let cfg: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        cfg.validate().unwrap();
+        let openai = cfg.new_api.channel_template.as_ref().unwrap();
+        assert_eq!(
+            openai.model_discovery.as_ref().unwrap().auth,
+            ModelDiscoveryAuth::Bearer
+        );
     }
 }

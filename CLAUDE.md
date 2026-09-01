@@ -14,6 +14,8 @@ src/
   orchestrator.rs  — 控制循环：按用量选活动 key、重排 priority
 docs/
   workflow.md      — 开发工作流程规范（@docs/workflow.md）
+  research/key-rotation-research.md   — 调研：周窗口临期优先（keyrot-1）
+  design/key-rotation/                — 架构 + 细化设计（keyrot-1）
 config.example.toml / config.toml(gitignored)
 ```
 
@@ -44,7 +46,7 @@ cargo run --release -- down config.toml    # 停 new-api
 
 - **new-api**（`QuantumNous/new-api`，旧名 `Calcium-Ion/new-api`）：管理 API、渠道类型码、setup 契约。源码用 `gh api repos/QuantumNous/new-api/contents/<path>?ref=<tag>` 拉。
 - **opencode**（`sst/opencode`）：`zhipuai-coding-plan` provider 定义、config/auth 优先级。
-- **models.dev**：opencode 的 provider 注册表（本机缓存 `~/.cache/opencode/models.json`）。
+- **上游 `/models`**：渠道模型目录的权威来源；models.dev 只用于核对 opencode 客户端是否展示该模型。
 
 ## 已知限制与注意事项（血泪，务必先读再动手）
 
@@ -57,6 +59,11 @@ cargo run --release -- down config.toml    # 停 new-api
   **selector 按 key 配**（不同 key 可能属不同组织/项目）。依据：CodexBar `docs/zai.md` + 实测。
   返回：`level`(如 max) + `limits[]`，`unit=3&number=5`→5小时窗口、`unit=6&number=1`→每周窗口、
   `TIME_LIMIT`(unit=5)=MCP 搜索次数（非用量窗口，须过滤）。
+  **⚠️ 窗口 type 有两种计费模式（2026-08 双团队实测）**：`TOKENS_LIMIT`（token 型）与
+  `CREDIT_LIMIT`（积分型），窗口语义相同（unit/number 定窗口、percentage=已用%），**都要算用量**；
+  只认 TOKENS_LIMIT 会让积分型团队的 key 永远「limits 为空」不参与决策（踩过）。
+  另：selector 决定查的是**哪个团队**的额度——账号属多个团队时，同一把 key 配不同 selector
+  会查到不同团队的窗口（都能查通但语义变了），务必按 key 所属团队配。
 - **⚠️ 教训（本项目最大的坑不是技术，是流程）**：我曾因用错鉴权（裸 key、缺 type/selector）就断言「用量读不到」，
   进而设计出「推理探测」的弯路，被用户三次打断。**根因是跳过调研直接下结论**。
   凡是「某接口不行」的结论，必须先查官方文档 + 社区实现 + 实测三者交叉验证，再下结论。
@@ -65,10 +72,33 @@ cargo run --release -- down config.toml    # 停 new-api
 - **new-api 建渠道 payload** 要 `{mode:"single", channel:{...}}` 包裹；`channel` 是指针，平铺会 nil-panic 500。字段：`type/key/base_url/models(逗号串)/group/priority/weight/status`。
 - **new-api PUT /api/channel 拒绝带 `status` 字段**的请求体（判 Invalid parameters）；改字段前必须 `obj.remove("status")`。GET 单渠道返回的 `key` 是空串，PUT 空 key 会保留原值（安全）。
 - **new-api 首启无默认 root/123456**：需先 `POST /api/setup {username,password,confirmPassword,SelfUseModeEnabled}`（密码≥8位、用户名≤12）建管理员，再登录拿会话。
-- **new-api 令牌 key 在列表里打码**（`aK1A****7H3Z`），真实值从 SQLite `tokens.key` 读；POST/PUT 到 `/api/xxx/` 要带**尾斜杠**（否则 307，reqwest 会自动跟随、urllib 不会）。
+- **new-api 令牌 key 在列表里打码**（`aK1A****7H3Z`），真实值从 SQLite `tokens.key` 读（或 `POST /api/token/:id/key` 直接回完整值）；POST/PUT 到 `/api/xxx/` 要带**尾斜杠**（否则 307，reqwest 会自动跟随、urllib 不会）；会话鉴权还要带 `New-Api-User: <用户id>` 头。
+- **new-api 管理面没有「调用户余额」的 API**：PUT /api/user/ 的 EditWithTx 白名单只有
+  username/display_name/group/remark/password（**quota 改不动、还回 success=true**）；
+  ManageUser 只有 enable/disable/delete 等。最短路径：直写 SQLite
+  `UPDATE users SET quota=… WHERE id=1` + **重启 new-api**（用户缓存靠重启失效；
+  quota 单位 = 货币数 × QuotaPerUnit(500000)）。
+- **⚠️ new-api `/api` 全局限流：360 次/180 秒（≈2 次/秒，env `GLOBAL_API_RATE_LIMIT`，不在 option 系统里）**。
+  2026-08-24 踩坑：面板曾**逐渠道**轮询 `/api/log/stat` 拉 rpm/tpm（N 把 key），
+  单面板就吃光预算 → 控制循环的 GET→PUT 被 429（且 429 响应体非 JSON，报「解析渠道响应失败」）
+  → 渠道 priority 卡旧值（出现过双 active 平分流量的实际伤害）。**已改**：面板实时指标全部从
+  `recent_logs` 单请求推导（`live_metrics_from_logs`）。教训：**任何面板改动都别引入逐渠道轮询**；
+  管理 API 预算要留给控制循环。login 另有 CriticalRateLimit（20 次/20 分钟），脚本反复登录会把自己锁死。
+- **⚠️ 已知遗留（2026-08 验收时发现，待修）**：new-api **重启会作废本工具的管理会话**，
+  而客户端不会在 401 后自动重登——之后面板读数全空（channels=0/quota=-1）、priority PUT
+  全失败（决策本身不坏：已下发的 priority 在 new-api 落了库）。临时处置：重启本工具进程。
+  正确修法：NewApiClient 检测管理调用 401 → 重登一次重试。
 - **new-api release 有独立二进制**（linux/arm64/macos/win），自带 SQLite，`PORT` env 指定端口；默认只在 **401** 自动禁用渠道（429/耗尽不禁），耗尽报文是中文「已达到…使用上限」不撞其英文禁用关键词 → 恢复干净。
 - **智谱 quota 返回只有整数 percentage**：`TOKENS_LIMIT` 窗口**没有** `usage`/`remaining` 字段（那俩只出现在
   `TIME_LIMIT`/MCP 搜索计数上，而它本就该被过滤掉）。⇒「还剩多少余量」的分辨率**就是 1%**，做不了更细的判断。
+- **周窗口重置时刻 = `limits[].nextResetTime`（epoch 毫秒，绝对时刻）**，探针原样透传为
+  `WindowStatus.next_reset_time`（`quota.rs`）。keyrot-1（周临期优先）用它做 EDF：`reset_ms - now_ms ∈ (0, lookahead]`
+  且周窗口、5h 窗口都有余量 ⇒ 临期。⚠️ **临期只在当前档位合格集内排序，不扩合格集**：
+  正常档仍严格 `< throttle`；只有全员 ≥ throttle 进入 Degraded 后，才允许 `< exhausted` 的 key 继续服务。
+  另外**临期判定用周窗口自己的 pct**、
+  可服务性用 max_pct（5h=100% 的 key 不算临期，选了立即 429）。**已知限制**：`watch_windows`
+  若配成只盯单窗口（默认盯两个），max_pct 不再是「5h 与周取大」，临期可服务性判定会退化——
+  该组合下整个调度语义本来就偏离设计假设，慎改。
 - **🔥「limits 为空」必须当错误抛，绝不能返回空 status**（`quota.rs` 曾经只 warn，是个潜伏的灾难）：
   配错 selector 时智谱**不报错**——它 `success=true` 地回一个空 `data`。若探针把它当成「查到了，但没有窗口」，
   `max_watch_pct()` 会算出 **0.0**，于是这把 key 在调度器眼里就是**「用量 0%」**：它会被选成活动 key 并且
@@ -89,6 +119,17 @@ cargo run --release -- down config.toml    # 停 new-api
   · **没有任何接口能查当前是否高峰**（`quota/limit` 响应无此字段；官方文档也无该接口）——只能按时钟算。
     因窗口按 **UTC+8** 定义，代码里必须按 `tz_offset` 算而**不是本机时区**（本机恰好 UTC+8 会掩盖这个 bug）。
 - **探测成本坑**：glm 是推理模型，`max_tokens:1` 挡不住思考（烧 ~660 token）；`thinking:{type:"disabled"}` 才压到 ~7 token。
+- **模型目录**：`up` / `sync` / AddKey 才调用每把 key 的 `/models`，不进 quota/面板周期。
+  成功结果权威；失败时存量渠道不动，新渠道才用模板 `models` fallback。鉴权值不得进日志。
+  旧智谱 Coding 模板缺配置块时自动补官方 models URL；其它 Custom 上游不猜。
+- **Claude Code 下游接入（claude-code-routing，2026-08-30 修正）**：NewAPI v1.0.0-rc.20
+  原生注册 `/v1/messages`，OpenAI adaptor 会把 Claude 请求（含 tools/system/content）转换后送入
+  现有 Custom(type 8) 智谱 Coding 渠道，并把响应转回 Anthropic SSE/JSON。已用当前唯一的
+  `opencode` NewAPI key 实测普通请求与流式请求（tools + cache_control）成功。
+  · 每把上游 key **只建一个渠道**；OpenAI/Claude 是下游请求格式，不复制渠道、不双写 priority。
+  · `ANTHROPIC_AUTH_TOKEN` 使用与 opencode 相同的 NewAPI key；不新建 Claude 专用 token/group。
+  · `ANTHROPIC_BASE_URL=http://127.0.0.1:3000`（Claude Code 自行拼 `/v1/messages`）。
+  · 未来的出口 key/group 功能是独立维度，禁止再把下游协议绑定成 group。
 - **认证**：智谱各口用 `Authorization: Bearer <裸 key>`（coding/推理口）；monitor 口社区脚本用裸 key（无 Bearer），但对团体 coding plan 无效。
 
 ## 工作流程

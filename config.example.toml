@@ -19,6 +19,13 @@ restore_threshold = 90.0
 # ⚠️ 智谱只返回整数 percentage（无 usage/remaining），所以这里的分辨率就是 1%。
 exhausted_threshold = 100.0
 
+# 【周临期优先】周窗口重置进入这个时间窗（小时）内的 key 视为「临期」：
+#   切换时会优先选它——快清零的额度用掉比浪费强（最大化额度使用效率）。
+#   · 判定条件：周窗口将在 N 小时内重置 ∧ 周窗口还有余量(<exhausted) ∧ 5h 窗口也还有余量。
+#   · 只在**发生切换**时影响排序；现任合格就不换（粘滞政策不变）。
+#   · 0 = 关闭本策略（行为与旧版完全一致）。建议 6–48h；上限 168（一周）。
+weekly_reset_lookahead_hours = 24
+
 dry_run = true               # 先 true 空跑验证日志；确认无误再改 false 真正生效
 watch_windows = ["five_hour", "weekly"]   # 同时盯 5 小时和每周窗口，取最大使用率
 
@@ -110,9 +117,20 @@ repo = "QuantumNous/new-api"
 # 类型(8) 原样透传全路径；OpenAI 类型(1) 会拼成 /v4/v1/... 报 404。
 type = 8
 base_url = "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
-# opencode zhipuai-coding-plan 的全部模型（取自 models.dev）
-models = "glm-4.7,glm-5.1,glm-5.2,glm-5-turbo,glm-5v-turbo,glm-4.6v,glm-4.5-air"
+# 仅作 /models 探测失败时的新渠道 fallback；平时以每把 key 的实时返回为准。
+models = "glm-4.5,glm-4.5-air,glm-4.6,glm-4.7,glm-5,glm-5-turbo,glm-5.1,glm-5.2,glm-5.3,glm-5.3-flash"
 group = "default"
+
+[new_api.channel_template.model_discovery]
+# 这一段可显式覆盖；旧智谱 Coding 模板即使缺少本段，也会自动使用同一官方端点。
+url = "https://open.bigmodel.cn/api/coding/paas/v4/models"
+auth = "bearer"              # Authorization: Bearer <key>
+
+# —— Claude Code 下游接入（无需额外渠道、group 或 key）——
+# NewAPI 原生在 /v1/messages 接收 Anthropic 格式，并转换到上面的同一批 type 8 渠道。
+# Claude Code 与 OpenAI/opencode 客户端使用**同一把 NewAPI 访问 key**；这里只需设置：
+#   ANTHROPIC_BASE_URL=http://127.0.0.1:3000
+#   ANTHROPIC_AUTH_TOKEN=<与 opencode 使用的相同 NewAPI key>
 
 # —— 一把智谱 key = 一个独立渠道 ——
 # name 同时用作 new-api 渠道名，sync 靠它解析/创建渠道。channel_id 可留空，交给 sync 自动解析。
@@ -120,6 +138,7 @@ group = "default"
 [[keys]]
 name = "zhipu-1"
 zhipu_api_key = "第一把智谱 key"
+# note = "wang"    # 可选：人类可读备注（如持有人名字），只在看板显示。⚠️ 必须写在 quota_headers 之前
 # channel_id = 1   # 可选：已有渠道时显式指定；留空则按 name 自动解析/创建
 # —— 团体套餐必需的 selector；不同 key 可能属不同组织/项目，故按 key 配 ——
 # 取法：浏览器打开 https://bigmodel.cn/coding-plan/team/usage-stats → F12 Network →

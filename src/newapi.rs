@@ -7,11 +7,12 @@
 //! 改 priority 仍用「GET 渠道 → 只改 priority → PUT 回」，整体搬运，对版本差异最鲁棒。
 //! ⚠️ channel_path / 建渠道字段 / 是否需要 New-Api-User，请用 F12 抓真实请求核实。
 
-use crate::config::{ChannelTemplate, NewApiConfig};
+use crate::config::{ChannelTemplate, KeyMapping, ModelDiscoveryConfig, NewApiConfig};
+use crate::model_catalog::{model_sets_equal, normalize_models_csv, ModelCatalogClient};
 use crate::status::{ChannelState, RequestLog};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
 /// new-api 列表响应兼容：新版 `data.items[]`，旧版 `data[]`。
@@ -44,8 +45,105 @@ enum Auth {
     Pending,
 }
 
+/// 建渠道参数：两种格式模板（OpenAI/Anthropic）归一到同一 payload 形状。
+/// 字段私有——外部只能经 From 转换拿到，杜绝手拼。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChannelParams<'a> {
+    channel_type: i64,
+    base_url: &'a str,
+    models: &'a str,
+    group: &'a str,
+    model_discovery: Option<&'a ModelDiscoveryConfig>,
+}
+
+impl<'a> From<&'a ChannelTemplate> for ChannelParams<'a> {
+    fn from(t: &'a ChannelTemplate) -> Self {
+        Self {
+            channel_type: t.channel_type,
+            base_url: &t.base_url,
+            models: &t.models,
+            group: &t.group,
+            model_discovery: t.model_discovery.as_ref(),
+        }
+    }
+}
+#[derive(Debug, PartialEq)]
+enum ChannelOp<'a> {
+    /// 已存在；有模板/发现配置时还要对账 models，不能再无条件跳过。
+    Skip {
+        name: String,
+        params: Option<ChannelParams<'a>>,
+        owner_name: &'a str,
+        key: &'a str,
+    },
+    /// 需要创建
+    Create {
+        name: String,
+        params: ChannelParams<'a>,
+        owner_name: &'a str,
+        key: &'a str,
+    },
+    /// openai 槽缺渠道且未配模板（现有 warn 语义）
+    Missing { name: String },
+}
+
+/// 纯函数：keys × 现有渠道名集合 × 模板 → 渠道操作计划（不执行、零 IO）。
+fn plan_channel_ops<'a>(
+    keys: &'a [KeyMapping],
+    existing: &HashSet<String>,
+    template: Option<&'a ChannelTemplate>,
+) -> Vec<ChannelOp<'a>> {
+    let mut ops = Vec::new();
+    for k in keys {
+        if existing.contains(&k.name) {
+            ops.push(ChannelOp::Skip {
+                name: k.name.clone(),
+                params: template.map(Into::into),
+                owner_name: &k.name,
+                key: &k.zhipu_api_key,
+            });
+        } else if let Some(t) = template {
+            ops.push(ChannelOp::Create {
+                name: k.name.clone(),
+                params: t.into(),
+                owner_name: &k.name,
+                key: &k.zhipu_api_key,
+            });
+        } else {
+            ops.push(ChannelOp::Missing { name: k.name.clone() });
+        }
+    }
+    ops
+}
+
+/// sync 结果：按 key 名索引其唯一上游渠道 id。
+#[derive(Debug, Default)]
+pub struct SyncOutcome {
+    pub primary: HashMap<String, i64>,
+}
+
+/// 新渠道最终采用的模型来源。供 AddKey 日志/回执说明是否发生了降级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelSource {
+    Discovered,
+    Fallback,
+}
+
+impl ModelSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovered => "discovered",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+type DiscoveryCache =
+    HashMap<(String, ModelDiscoveryConfig), std::result::Result<Vec<String>, String>>;
+
 pub struct NewApiClient {
     client: reqwest::Client,
+    catalog: ModelCatalogClient,
     base_url: String,
     channel_path: String,
     auth: Auth,
@@ -66,6 +164,7 @@ impl NewApiClient {
             Auth::Token(cfg.admin_token.clone())
         };
         Ok(Self {
+            catalog: ModelCatalogClient::new(client.clone()),
             client,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             channel_path: cfg.channel_path.clone(),
@@ -285,24 +384,96 @@ impl NewApiClient {
         Ok(out)
     }
 
-    /// 创建一把 key 对应的渠道（把 name/key/priority 合并进模板 POST）。
-    pub async fn create_channel(
+    fn fallback_models(p: &ChannelParams<'_>) -> Result<String> {
+        let models = normalize_models_csv(p.models);
+        anyhow::ensure!(
+            !models.is_empty(),
+            "渠道模板的 fallback models 为空，无法创建渠道"
+        );
+        Ok(models.join(","))
+    }
+
+    /// 单次 sync 的发现缓存。key 只以非敏感的 owner name 作为缓存身份；真实 API key
+    /// 不进入 HashMap key、日志或错误。同一 key + 发现配置只请求一次上游。
+    async fn discover_cached(
         &self,
-        tpl: &ChannelTemplate,
+        owner_name: &str,
+        key: &str,
+        cfg: &ModelDiscoveryConfig,
+        cache: &mut DiscoveryCache,
+    ) -> std::result::Result<Vec<String>, String> {
+        let cache_key = (owner_name.to_string(), cfg.clone());
+        if let Some(result) = cache.get(&cache_key) {
+            return result.clone();
+        }
+        let result = self
+            .catalog
+            .discover(cfg, key)
+            .await
+            .map_err(|e| e.to_string());
+        cache.insert(cache_key, result.clone());
+        result
+    }
+
+    async fn resolve_models_for_create(
+        &self,
+        owner_name: &str,
+        key: &str,
+        p: &ChannelParams<'_>,
+        cache: &mut DiscoveryCache,
+    ) -> Result<(String, ModelSource)> {
+        if let Some(cfg) = p.model_discovery {
+            match self.discover_cached(owner_name, key, cfg, cache).await {
+                Ok(models) => return Ok((models.join(","), ModelSource::Discovered)),
+                Err(error) => warn!(
+                    owner = owner_name,
+                    url = %cfg.url,
+                    error,
+                    "模型目录探测失败，新渠道降级使用配置 fallback"
+                ),
+            }
+        }
+        Ok((Self::fallback_models(p)?, ModelSource::Fallback))
+    }
+
+    /// AddKey 使用的入口：在请求发生时即时发现，不复用进程启动时的静态模型字符串。
+    pub async fn create_channel_resolving_models(
+        &self,
+        name: &str,
+        owner_name: &str,
+        key: &str,
+        priority: i64,
+        p: &ChannelParams<'_>,
+    ) -> Result<ModelSource> {
+        let mut cache = DiscoveryCache::new();
+        let (models, source) = self
+            .resolve_models_for_create(owner_name, key, p, &mut cache)
+            .await?;
+        self.create_channel_with_models(name, key, priority, p, &models)
+            .await?;
+        Ok(source)
+    }
+
+    /// 创建一个渠道（把 name/key/priority 与已经解析好的 models 合并进模板参数 POST）。
+    async fn create_channel_with_models(
+        &self,
         name: &str,
         key: &str,
         priority: i64,
+        p: &ChannelParams<'_>,
+        models: &str,
     ) -> Result<()> {
+        anyhow::ensure!(!normalize_models_csv(models).is_empty(), "渠道 models 不能为空");
         // new-api 的 AddChannel 期望 { mode, channel:{...} }，channel 是指针，缺了会 nil-panic。
         let payload = json!({
             "mode": "single",
             "channel": {
                 "name": name,
-                "type": tpl.channel_type,
+                "type": p.channel_type,
                 "key": key,
-                "base_url": tpl.base_url,
-                "models": tpl.models,
-                "group": tpl.group,
+                "base_url": p.base_url,
+                "models": models,
+                "group": p.group,
                 "priority": priority,
                 "weight": 0,
                 "status": 1,
@@ -323,63 +494,164 @@ impl NewApiClient {
         Ok(())
     }
 
-    /// 按 key 列表对齐 new-api 渠道：缺的就（用模板）建出来，返回 name → channel_id。
-    /// 没配 channel_template 时不建，只解析已有同名渠道。
-    pub async fn sync_channels(
-        &self,
-        keys: &[crate::config::KeyMapping],
-        tpl: Option<&ChannelTemplate>,
-        standby_priority: i64,
-    ) -> Result<HashMap<String, i64>> {
-        let existing = self.list_channels().await?;
-        let mut created = false;
-        for k in keys {
-            if existing.contains_key(&k.name) {
-                info!(name = %k.name, "渠道已存在，跳过创建");
-                continue;
-            }
-            match tpl {
-                Some(tpl) => {
-                    info!(name = %k.name, "创建渠道");
-                    self.create_channel(tpl, &k.name, &k.zhipu_api_key, standby_priority)
-                        .await?;
-                    created = true;
-                }
-                None => warn!(name = %k.name, "渠道不存在且未配 channel_template，无法自动创建"),
-            }
-        }
-        // 有新建就重新拉一遍，拿到新 id
-        if created {
-            self.list_channels().await
-        } else {
-            Ok(existing)
-        }
-    }
-
-    /// 【看板】某渠道**最近 60 秒**的 (rpm, tpm)。纯读。
-    ///
-    /// 依据：new-api `model/log.go` 的 `SumUsedQuota` —— `// 只统计最近60秒的rpm和tpm`，
-    /// 且 `rpmTpmQuery.Where("channel_id = ?", channel)` 支持按渠道过滤。
-    /// **rpm > 0 ⟺ 流量正在走这把 key**（「有没有连上」的直接答案）。
-    pub async fn channel_rate(&self, channel_id: i64) -> Result<(i64, i64)> {
-        // type=2 = LogTypeConsume；start/end 只影响 quota 字段，rpm/tpm 的 60s 窗口由服务端固定
-        let url = format!(
-            "{}/api/log/stat?type=2&channel={channel_id}&start_timestamp=0&end_timestamp=9999999999",
-            self.base_url
+    /// 已有渠道只对账 models。集合相同零写；漂移时整体搬运渠道对象，只替换 models，
+    /// 并回读验证模型与 priority/group/status 三个调度不变量。
+    async fn ensure_channel_models(&self, id: i64, name: &str, desired: &str) -> Result<bool> {
+        anyhow::ensure!(
+            !normalize_models_csv(desired).is_empty(),
+            "渠道 {name} 的目标 models 为空"
         );
-        let body: Value = self
-            .apply_headers(self.client.get(&url))
+        let mut channel = self.get_channel(id).await?;
+        let current = s(&channel, "models");
+        if model_sets_equal(&current, desired) {
+            return Ok(false);
+        }
+
+        let before_priority = i(&channel, "priority");
+        let before_status = i(&channel, "status");
+        let before_group = s(&channel, "group");
+        let obj = channel
+            .as_object_mut()
+            .with_context(|| format!("渠道 {id} 返回的不是 JSON 对象"))?;
+        obj.insert("models".to_string(), Value::from(desired));
+        // new-api UpdateChannel 拒绝带 status；GET 返回的空 key 表示保留原 key。
+        obj.remove("status");
+
+        let url = format!("{}{}", self.base_url, self.channel_path);
+        let resp = self
+            .apply_headers(self.client.put(&url))
+            .json(&channel)
             .send()
             .await
-            .context("拉取渠道实时速率失败")?
-            .json()
-            .await
-            .context("解析实时速率失败")?;
-        let d = body.get("data");
-        Ok((
-            d.and_then(|x| x.get("rpm")).and_then(|v| v.as_i64()).unwrap_or(0),
-            d.and_then(|x| x.get("tpm")).and_then(|v| v.as_i64()).unwrap_or(0),
-        ))
+            .with_context(|| format!("更新渠道 {name} models 失败"))?;
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        let ok = body
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(status.is_success());
+        if !ok {
+            bail!("更新渠道 {name} models 失败: HTTP {status} body={body}");
+        }
+
+        let after = self.get_channel(id).await?;
+        anyhow::ensure!(
+            model_sets_equal(&s(&after, "models"), desired),
+            "渠道 {name} models 更新后回读不一致"
+        );
+        anyhow::ensure!(
+            i(&after, "priority") == before_priority
+                && i(&after, "status") == before_status
+                && s(&after, "group") == before_group,
+            "渠道 {name} models 更新意外改变了 priority/status/group"
+        );
+        Ok(true)
+    }
+
+    /// 按 key 列表对齐唯一的上游渠道：缺失则按模板创建；存在时按 `/models` 对账。
+    /// Claude 是 NewAPI 已支持的下游请求格式，复用同一渠道与访问 key，不在这里复制渠道。
+    pub async fn sync_channels(
+        &self,
+        keys: &[KeyMapping],
+        template: Option<&ChannelTemplate>,
+        standby_priority: i64,
+    ) -> Result<SyncOutcome> {
+        let existing = self.list_channels().await?;
+        let names: HashSet<String> = existing.keys().cloned().collect();
+        let plan = plan_channel_ops(keys, &names, template);
+
+        let mut created = false;
+        let mut discovery_cache = DiscoveryCache::new();
+        for op in &plan {
+            match op {
+                ChannelOp::Skip {
+                    name,
+                    params,
+                    owner_name,
+                    key,
+                } => {
+                    let Some(params) = params else {
+                        info!(name = %name, "渠道已存在；未配模板，跳过模型对账");
+                        continue;
+                    };
+                    let Some(discovery) = params.model_discovery else {
+                        info!(name = %name, "渠道已存在；未开启模型发现，跳过模型对账");
+                        continue;
+                    };
+                    match self
+                        .discover_cached(owner_name, key, discovery, &mut discovery_cache)
+                        .await
+                    {
+                        Ok(models) => {
+                            let desired = models.join(",");
+                            match self.ensure_channel_models(existing[name], name, &desired).await {
+                                Ok(true) => info!(name = %name, count = models.len(), "已按上游 /models 更新渠道模型"),
+                                Ok(false) => info!(name = %name, count = models.len(), "渠道模型已与上游一致"),
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        Err(error) => warn!(
+                            name = %name,
+                            url = %discovery.url,
+                            error,
+                            "模型目录探测失败，已有渠道 models 保持不变"
+                        ),
+                    }
+                }
+                ChannelOp::Missing { name } => warn!(
+                    name = %name,
+                    "渠道不存在且未配 channel_template，无法自动创建"
+                ),
+                ChannelOp::Create {
+                    name,
+                    params,
+                    owner_name,
+                    key,
+                } => {
+                    let result = match self
+                        .resolve_models_for_create(
+                            owner_name,
+                            key,
+                            params,
+                            &mut discovery_cache,
+                        )
+                        .await
+                    {
+                        Ok((models, source)) => {
+                            info!(name = %name, models_source = source.as_str(), "创建渠道");
+                            self.create_channel_with_models(
+                                name,
+                                key,
+                                standby_priority,
+                                params,
+                                &models,
+                            )
+                            .await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match result {
+                        Ok(()) => created = true,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+
+        // 有新建就重新拉一遍，拿到新 id；否则用第一遍的
+        let latest = if created {
+            self.list_channels().await?
+        } else {
+            existing
+        };
+
+        let mut out = SyncOutcome::default();
+        for k in keys {
+            if let Some(id) = latest.get(&k.name) {
+                out.primary.insert(k.name.clone(), *id);
+            }
+        }
+        Ok(out)
     }
 
     /// 【看板】用量统计（new-api 自己按**小时**聚合好的 `quota_data`）。纯读。
@@ -487,5 +759,83 @@ impl NewApiClient {
     /// 设置渠道 priority——本工具「钉住单把活动 key」的唯一运行期杠杆。
     pub async fn set_channel_priority(&self, id: i64, priority: i64) -> Result<()> {
         self.set_channel_field(id, "priority", priority).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(name: &str) -> KeyMapping {
+        KeyMapping {
+            name: name.into(),
+            zhipu_api_key: format!("k-{name}"),
+            channel_id: None,
+            note: String::new(),
+            quota_headers: Vec::new(),
+        }
+    }
+
+    fn openai_tpl() -> ChannelTemplate {
+        ChannelTemplate {
+            channel_type: 8,
+            base_url: "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions".into(),
+            models: "glm-5.2".into(),
+            group: "default".into(),
+            model_discovery: None,
+        }
+    }
+
+    fn names(ops: &[ChannelOp]) -> Vec<String> {
+        ops.iter()
+            .map(|o| match o {
+                ChannelOp::Skip { name, .. } | ChannelOp::Create { name, .. } | ChannelOp::Missing { name } => name.clone(),
+            })
+            .collect()
+    }
+
+    fn existing(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn 全新建_每把key只创建一个上游渠道() {
+        let keys = [key("zhipu-1")];
+        let template = openai_tpl();
+        let ops = plan_channel_ops(&keys, &existing(&[]), Some(&template));
+        assert_eq!(names(&ops), vec!["zhipu-1"]);
+        let ChannelOp::Create { key, .. } = &ops[0] else { unreachable!() };
+        assert_eq!(*key, "k-zhipu-1");
+    }
+
+    #[test]
+    fn 已存在_进入模型对账而不重复创建() {
+        let keys = [key("zhipu-1")];
+        let template = openai_tpl();
+        let ops = plan_channel_ops(&keys, &existing(&["zhipu-1"]), Some(&template));
+        let ChannelOp::Skip { params, key, owner_name, .. } = &ops[0] else { unreachable!() };
+        assert!(params.is_some(), "配了模板的存量渠道必须进入模型对账");
+        assert_eq!(*key, "k-zhipu-1");
+        assert_eq!(*owner_name, "zhipu-1");
+    }
+
+    #[test]
+    fn openai无模板且渠道缺_产missing() {
+        let keys = [key("zhipu-1")];
+        let ops = plan_channel_ops(&keys, &existing(&[]), None);
+        assert_eq!(
+            ops,
+            vec![ChannelOp::Missing { name: "zhipu-1".into() }]
+        );
+    }
+
+    #[test]
+    fn 混合_key1_skip_key2_create() {
+        let keys = [key("zhipu-1"), key("zhipu-2")];
+        let template = openai_tpl();
+        let ops = plan_channel_ops(&keys, &existing(&["zhipu-1"]), Some(&template));
+        assert_eq!(names(&ops), vec!["zhipu-1", "zhipu-2"]);
+        assert!(matches!(ops[0], ChannelOp::Skip { .. }));
+        assert!(matches!(ops[1], ChannelOp::Create { .. }));
     }
 }

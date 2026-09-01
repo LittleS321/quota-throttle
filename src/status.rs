@@ -30,6 +30,8 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct KeyStatus {
     pub name: String,
+    /// 人类可读备注（如持有人名字），只显示；空则前端不渲染
+    pub note: String,
     pub channel_id: i64,
     /// 5 小时窗口已用%；None = 本轮未取到
     pub five_hour_pct: Option<f64>,
@@ -40,6 +42,9 @@ pub struct KeyStatus {
     pub weekly_reset: Option<i64>,
     /// 监控窗口取最大（决策依据）；None = 查询失败（**不是 0%**）
     pub max_pct: Option<f64>,
+    /// keyrot-1：是否临期（周窗口即将重置且还有余量）。与决策同源，仅供看板/日志。
+    #[serde(default)]
+    pub imminent: bool,
     /// "active" | "standby" | "exhausted" | "unknown"
     pub tier: String,
     /// 本工具最近成功下发的 priority
@@ -175,12 +180,18 @@ pub struct StatusSnapshot {
     pub regime: String,
     /// 合格集：自动逻辑允许把流量放上去的渠道。前端据此决定 pin 按钮灰不灰
     pub eligible: Vec<i64>,
+    /// keyrot-1：周窗口临期时间窗（小时）。0 = 策略关闭（前端显示「周临期优先 关」）
+    #[serde(default)]
+    pub weekly_reset_lookahead_hours: u64,
     pub last_pin_release: Option<PinReleaseInfo>,
     /// 智谱高峰时段（只显示，不参与调度决策）
     pub peak: PeakInfo,
     pub keys: Vec<KeyStatus>,
-    /// 客户端应连的地址（= new_api_base + /v1）
+    /// opencode 客户端应连的地址（= new_api_base + /v1）
     pub client_endpoint: String,
+    /// Claude Code 应填的 ANTHROPIC_BASE_URL（= new_api_base）。
+    /// NewAPI 原生支持该下游格式，因此服务健康时始终提供。
+    pub claude_endpoint: String,
     /// new-api **内部虚拟余额**（root 用户）。它按「按量付费倍率」给包月套餐虚构记账，
     /// 一旦见底会**直接挡住转发**（「预扣费额度失败」），跟智谱额度毫无关系。
     /// 低于阈值时看板告警，避免无声卡死。
@@ -203,8 +214,8 @@ fn read_snap(snap: &Shared) -> StatusSnapshot {
     snap.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// 当前管辖的渠道 id。面板循环据此拉实时指标——**从快照读而不是自持一份副本**，
-/// 这样看板加/删 key 之后无需重启，面板数据就能跟上。
+/// 当前管辖的渠道 id。面板循环据此拉实时指标——
+/// **从快照读而不是自持一份副本**，这样看板加/删 key 之后无需重启，面板数据就能跟上。
 pub fn tracked_channels(snap: &Shared) -> Vec<i64> {
     snap.read()
         .unwrap_or_else(|e| e.into_inner())
@@ -390,18 +401,20 @@ fn err_json(msg: impl AsRef<str>) -> String {
 /// 把命令投给控制循环并等回执。
 ///
 /// - 队列满 → **503 立刻返回**：既不阻塞 HTTP 线程，也不阻塞控制循环。
-/// - 控制循环 10 秒没回 → 504（正常情况下是毫秒级；加 key 要探活智谱，故给足 10 秒）。
+/// - 超时未回 → 504。普通控制命令给 10 秒；AddKey 还要 quota 探活、`/models`、建渠道和
+///   发布新快照，单独给 60 秒，避免模型发现 10 秒 fallback 后产生“前端失败、后台成功”。
 /// - 命令自身失败（如 pin 一把不合格的 key）→ **409 + 原因**，前端直接显示这句话。
 async fn dispatch<T: Serialize>(
     tx: &mpsc::Sender<Command>,
     make: impl FnOnce(oneshot::Sender<Result<T, String>>) -> Command,
     ok_status: &'static str,
+    timeout: Duration,
 ) -> (&'static str, String) {
     let (rtx, rrx) = oneshot::channel();
     if tx.try_send(make(rtx)).is_err() {
         return ("503 Service Unavailable", err_json("控制循环忙，请稍后重试"));
     }
-    match tokio::time::timeout(Duration::from_secs(10), rrx).await {
+    match tokio::time::timeout(timeout, rrx).await {
         Ok(Ok(Ok(v))) => {
             // 无返回值的命令（pin/unpin）序列化成 "null"，前端不好判 ⇒ 统一给 {"ok":true}
             let mut s = serde_json::to_string(&v).unwrap_or_default();
@@ -514,6 +527,7 @@ async fn handle_conn(
                         &tx,
                         |reply| Command::Pin { channel_id, reply },
                         "200 OK",
+                        Duration::from_secs(10),
                     )
                     .await;
                     (st, JSON, b)
@@ -526,13 +540,24 @@ async fn handle_conn(
             }
         }
         ("DELETE", "/api/pin") => {
-            let (st, b) = dispatch(&tx, |reply| Command::Unpin { reply }, "200 OK").await;
+            let (st, b) = dispatch(
+                &tx,
+                |reply| Command::Unpin { reply },
+                "200 OK",
+                Duration::from_secs(10),
+            )
+            .await;
             (st, JSON, b)
         }
         ("POST", "/api/keys") => match serde_json::from_str::<NewKeySpec>(&req.body) {
             Ok(spec) => {
-                let (st, b) =
-                    dispatch(&tx, |reply| Command::AddKey { spec, reply }, "201 Created").await;
+                let (st, b) = dispatch(
+                    &tx,
+                    |reply| Command::AddKey { spec, reply },
+                    "201 Created",
+                    Duration::from_secs(60),
+                )
+                .await;
                 (st, JSON, b)
             }
             Err(e) => (
@@ -548,6 +573,7 @@ async fn handle_conn(
                         &tx,
                         |reply| Command::RemoveKey { channel_id, reply },
                         "200 OK",
+                        Duration::from_secs(10),
                     )
                     .await;
                     (st, JSON, b)
@@ -626,6 +652,8 @@ fn render_html() -> String {
  .card.off{border-color:rgba(242,85,90,.5);background:linear-gradient(180deg,rgba(242,85,90,.08),transparent 60%),var(--card)}
  .chead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
  .name{font-size:16px;font-weight:650}
+ .note{margin-left:7px;padding:2px 8px;border-radius:999px;background:rgba(91,140,255,.14);
+       color:var(--accent);font-size:12px;font-weight:600;vertical-align:middle}
  .tier{padding:2px 10px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.04em}
  .t-active{background:rgba(62,207,142,.16);color:var(--ok)}
  .t-standby{background:rgba(139,148,163,.16);color:#aeb6c2}
@@ -634,6 +662,7 @@ fn render_html() -> String {
  .badge{padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700}
  .b-on{background:rgba(62,207,142,.13);color:var(--ok)}
  .b-off{background:rgba(242,85,90,.22);color:var(--bad)}
+ .b-imminent{background:rgba(91,140,255,.15);color:var(--accent)}
  .cid{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
  .live{display:flex;align-items:center;gap:9px;margin:12px 0 16px;font-size:13px;
        font-variant-numeric:tabular-nums;color:var(--dim)}
@@ -799,7 +828,7 @@ document.getElementById('addf').addEventListener('submit',async e=>{
   try{
     const j=await call('POST','/api/keys',body);
     msg.innerHTML=`<div class="ban ban-info">✅ 已添加 <b>${body.name}</b>（渠道 #${j.channel_id}）
-      · 套餐 <b>${j.level||'—'}</b> · 5 小时窗口 <b>${j.five_hour_pct??'—'}%</b> · 每周 <b>${j.weekly_pct??'—'}%</b>
+      · 套餐 <b>${j.level||'—'}</b> · 模型 <b>${j.models_source==='discovered'?'实时探测':'配置 fallback'}</b> · 5 小时窗口 <b>${j.five_hour_pct??'—'}%</b> · 每周 <b>${j.weekly_pct??'—'}%</b>
       · 已写回 config.toml，重启后仍在。以 standby 入场，下一轮自动决策决定要不要转正。</div>`;
     e.target.reset(); tick();
   }catch(err){
@@ -981,7 +1010,8 @@ async function tick(){
 
   document.getElementById('sub').textContent=
     `任一窗口达 ${thr}% 即切换 · 挑新活动 key 要求低于 ${d.restore_threshold}%`
-    + ` · 全部 key 都超线时，榨到 ${d.exhausted_threshold}% 再流转（不硬撞 429）`;
+    + ` · 全部 key 都超线时，榨到 ${d.exhausted_threshold}% 再流转（不硬撞 429）`
+    + ` · 周临期优先 ${d.weekly_reset_lookahead_hours>0?d.weekly_reset_lookahead_hours+' 小时内重置的 key': '关'}`;
 
   const q=d.newapi_user_quota;
   document.getElementById('chips').innerHTML=`
@@ -989,8 +1019,10 @@ async function tick(){
      <span class="k">new-api</span><span class="v">${d.new_api_healthy?'健康':'不可达'}</span></div>
    <div class="chip"><span class="k">活动 key</span>
      <span class="v" style="color:var(--ok)">${act?act.name:'无 · 全部无额度'}${d.pinned_channel_id!=null?' 📌':''}</span></div>
-   <div class="chip"><span class="k">客户端连接</span>
+   <div class="chip"><span class="k">opencode</span>
      <span class="copy" title="点击复制" onclick="navigator.clipboard.writeText('${d.client_endpoint||''}');this.textContent='已复制';setTimeout(()=>this.textContent='${d.client_endpoint||''}',900)">${d.client_endpoint||'—'}</span></div>
+   ${d.claude_endpoint?`<div class="chip"><span class="k">Claude Code</span>
+     <span class="copy" title="ANTHROPIC_AUTH_TOKEN 使用同一把 NewAPI key；点击复制 ANTHROPIC_BASE_URL" onclick="navigator.clipboard.writeText('${d.claude_endpoint}');this.textContent='已复制';setTimeout(()=>this.textContent='${d.claude_endpoint}',900)">${d.claude_endpoint}</span><span class="k">共用 key</span></div>`:''}
    ${peakChip(d.peak)}
    ${(q!=null&&q>=0&&q<LOW)?'<div class="chip" style="border-color:var(--bad)"><span class="v" style="color:var(--bad)">new-api 内部余额即将耗尽</span><span class="k">见底会挡住转发（与智谱额度无关）</span></div>':''}
    ${d.dry_run?'<div class="chip" style="border-color:rgba(245,185,66,.5)"><span class="v" style="color:var(--warn)">dry_run</span><span class="k">只打印决策，不真改 new-api</span></div>':''}`;
@@ -1016,7 +1048,8 @@ async function tick(){
     const disabled = c && !c.enabled;
     const mism = c && c.priority!=null && k.priority!=null && c.priority!==k.priority;
     const on = l && l.rpm>0;
-    const lastTxt = l&&l.last_request_at ? `最后请求 ${ago(l.last_request_at)}${l.last_request_model?` (${l.last_request_model})`:''}` : '暂无请求记录';
+    const lastOf=l;
+    const lastTxt = lastOf&&lastOf.last_request_at ? `最后请求 ${ago(lastOf.last_request_at)}${lastOf.last_request_model?` (${lastOf.last_request_model})`:''}` : '暂无请求记录';
     // pin 按钮：只有合格的才点得动（pin 是优先级，不是安全豁免）
     const isPinned = k.channel_id===d.pinned_channel_id;
     const ok = eligible.has(k.channel_id);
@@ -1029,8 +1062,9 @@ async function tick(){
     return `
    <div class="card ${k.tier==='active'?'act':''} ${k.tier==='exhausted'?'dead':''} ${disabled?'off':''}">
      <div class="chead">
-       <span class="name">${k.name}</span>
+       <span class="name">${k.name}</span>${k.note?`<span class="note">${k.note}</span>`:''}
        <span class="tier t-${k.tier}">${TIER[k.tier]||k.tier}</span>
+       ${k.imminent?'<span class="badge b-imminent" title="周窗口即将重置且还有余量 — 切换时会优先烧它">⏳ 临期</span>':''}
        <span class="cid">渠道 #${k.channel_id}</span>
        ${c ? (c.enabled ? '<span class="badge b-on">启用</span>'
              : `<span class="badge b-off">已被 new-api 禁用</span>`) : ''}
@@ -1042,7 +1076,8 @@ async function tick(){
      <div class="live">
        <span class="${on?'pulse':'idle'}"></span>
        <span><b>${l?l.rpm:0}</b> req/min</span><span>·</span>
-       <span><b>${kfmt(l?l.tpm:0)}</b> tok/min</span><span>·</span>
+       <span><b>${kfmt(l?l.tpm:0)}</b> tok/min</span>
+       <span>·</span>
        <span>${lastTxt}</span>
      </div>
 
@@ -1059,7 +1094,7 @@ async function tick(){
      </div>
    </div>`}).join('');
 
-  // 野生渠道：new-api 里有、但不在我们管辖的 keys 里 —— 可能偷偷接到流量
+  // 野生渠道：new-api 里有、但不在我们管辖的 keys 里——可能偷偷接到流量
   const mine=new Set(d.keys.map(k=>k.channel_id));
   const wild=(d.channels||[]).filter(c=>!mine.has(c.id));
   document.getElementById('wild').innerHTML = !wild.length ? '' : `

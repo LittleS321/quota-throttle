@@ -96,7 +96,13 @@ value = "proj_..."
 
 ### 重载方法（改完 config.toml 后）
 
+config 只在启动时读一次，改完必须重启进程：
+
 ```bash
+# launchd 常驻时（推荐，见「常驻运行」）：
+launchctl kickstart -k gui/$(id -u)/com.quota-throttle
+
+# 手动 nohup 时：
 pkill -f 'quota-throttle up'
 nohup ./target/release/quota-throttle up config.toml >> .newapi/quota-throttle.log 2>&1 &
 tail -f .newapi/quota-throttle.log     # 看它起来后的渠道映射与首轮决策
@@ -112,9 +118,48 @@ tail -f .newapi/quota-throttle.log     # 看它起来后的渠道映射与首轮
 | **替换同名 key 的值**（换新 key 但沿用名字） | ⚠️ **sync 按名幂等，不会更新已存在渠道里的旧 key！** 除了改 config + 重载，还须更新渠道里的 key：new-api 管理页（`http://127.0.0.1:3000`，登录后 渠道 → 编辑 `zhipu-N` → 粘贴新 key），或直写 SQLite `UPDATE channels SET key='<新key>' WHERE name='zhipu-N';` |
 | **移除 key** | config 删掉那条 `[[keys]]` → 重载。**new-api 渠道会留下来**（保历史用量）且不再被管理——它会出现在看板「野生渠道」区，务必把它的 priority 压到 0（否则 429 兜底时可能把流量漏给一把你不想要的 key）。更省事的做法：直接在看板卡片上点「✕ 停止调度」（自动压 priority + 写回 config，一步到位） |
 
-### 常驻运行
+### 常驻运行（macOS：launchd 登录自启 + 崩溃自动拉起）
 
-`up` 循环建议用 `nohup` 脱离终端跑（上面的重载命令即是）。它**不会开机自启**；停它用 `pkill -f 'quota-throttle up'`（new-api 是独立进程，不受影响；`down` 子命令才是停 new-api）。
+推荐用 **LaunchAgent** 常驻。把下面内容存成 `~/Library/LaunchAgents/com.quota-throttle.plist`（`/path/to` 换成实际项目位置）：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.quota-throttle</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/quota-throttle/target/release/quota-throttle</string>
+        <string>up</string>
+        <string>config.toml</string>
+    </array>
+    <!-- 工作目录必须钉在项目根：data_dir="./.newapi" 是相对路径，不钉数据会散落到 / -->
+    <key>WorkingDirectory</key><string>/path/to/quota-throttle</string>
+    <key>RunAtLoad</key><true/>   <!-- 登录即启动 -->
+    <key>KeepAlive</key><true/>   <!-- 崩溃自动拉起；up 幂等，new-api 已健康则复用，不冲突 -->
+    <key>StandardOutPath</key><string>/path/to/quota-throttle/.newapi/launchd.log</string>
+    <key>StandardErrorPath</key><string>/path/to/quota-throttle/.newapi/launchd.log</string>
+</dict>
+</plist>
+```
+
+启用与日常管理：
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.quota-throttle.plist   # 启用（之后登录自启）
+launchctl list      | grep quota-throttle                                          # 查状态（第一列是 PID）
+launchctl kickstart -k gui/$(id -u)/com.quota-throttle                                # 重启（重载 config / 换新编译的二进制都用它；⚠️ 必须带 -k，否则只会在没跑时拉起）
+launchctl bootout    gui/$(id -u)/com.quota-throttle                                # 停止并卸载（不想自启了：bootout + 删掉 plist）
+```
+
+注意：
+
+- **launchd 接管后 `down` 的语义变了**：`down` 只停 new-api，KeepAlive 会让本工具进程继续空转。要彻底停：先 `bootout`，再 `down config.toml`。
+- 二进制指向 `target/release/`：`cargo clean` 后自启会失效，重新 `cargo build --release` 即恢复。
+- 日志在 `.newapi/launchd.log`（⚠️ 含接入令牌，勿外传）。
+
+不想用 launchd 时也可以手动 `nohup` 跑（`nohup ./target/release/quota-throttle up config.toml >> .newapi/quota-throttle.log 2>&1 &`），停它用 `pkill -f 'quota-throttle up'`（new-api 是独立进程，不受影响；`down` 子命令才是停 new-api）。
 
 ## 状态看板
 

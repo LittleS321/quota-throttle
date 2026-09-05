@@ -58,6 +58,81 @@ cargo run --release -- up config.toml  # 起 new-api + 建渠道 + 进入切换�
 
 数据（SQLite / 二进制 / 日志 / PID）都在 `./.newapi/`。日志级别用 `RUST_LOG` 控制。
 
+## 新用户上手：申请 key → 配置 → 跑通
+
+### 第 1 步：申请两类 API key（别混用）
+
+本工具涉及**两种完全不同的 key**，方向相反、填的位置也不同：
+
+| | 上游智谱 key | 下游 NewAPI 令牌 |
+|---|---|---|
+| 谁发给你的 | 智谱开放平台 | 本工具托管的 new-api |
+| 填在哪 | `config.toml` 的 `[[keys]]` | 客户端（opencode / Claude Code） |
+| 作用 | 查用量 + 建渠道（真正烧的额度） | 客户端访问 new-api 的凭证 |
+
+**A. 上游智谱 key**（≥2 把才有意义——轮换是本工具的核心价值）：
+
+1. 登录 [bigmodel.cn](https://bigmodel.cn)（注册 + 实名），订阅 **GLM Coding Plan**（个人或团体套餐）
+2. 控制台 → **API Keys** → 新建并复制（形如 `xxxxxxxx.yyyyyyyy`，中间一个点）
+3. 团体套餐还要按下面「org / project 的值在智谱网页上怎么取」逐把抄 selector
+4. 嫌麻烦可跳过手工编辑：服务跑起来后直接在看板「**探活并添加**」录入——探活不过就什么都不改，selector 配错会当场挡下
+
+**B. 下游 NewAPI 令牌**（`up` 跑起来之后才有地方申请）：
+
+1. 浏览器开 `http://127.0.0.1:3000`，用 `root` + 你在 `config.toml` 里设的密码登录
+2. 左侧 **令牌** → 添加令牌 → 复制 `sk-xxx`（令牌列表里是打码的，创建时或编辑页能拿到全值）
+3. **一把令牌通用所有下游协议**：OpenAI 兼容口（`/v1`）和 Claude Code（`/v1/messages`）都用它，见「接入要点」第 3 / 4 条
+
+### 第 2 步：填 config.toml（必改三处）
+
+```toml
+# ① 管理员密码（首启自动建 root 用，≥8 位）
+root_password = "改成你自己的"
+
+# ② 逐把填智谱 key + selector（完整格式见 example 与下节）
+[[keys]]
+name = "zhipu-1"
+zhipu_api_key = "xxxxxxxx.yyyyyyyy"
+
+# ③ 先空跑：确认日志里决策符合预期，再改 false 真正生效
+dry_run = true
+```
+
+其余保持 example 默认即可。⚠️ **顶层配置项必须写在第一个 `[表]` 头之前**——TOML 表头一旦出现，后面的裸 `key = value` 都归那个表，不报错、只走默认值。
+
+### 第 3 步：起服务 → 验证 → 接客户端
+
+```bash
+cargo run --release -- up config.toml
+```
+
+自动完成：下载 new-api（sha256 校验）→ 首启建管理员 → 每把 key 建一个渠道 → 进入切换循环 + 看板。
+
+验证：
+
+- 看板 `http://127.0.0.1:3001`：每把 key 正常显示用量（出现「查询失败」= selector/鉴权没配对，见「接入要点」1）
+- `dry_run = true` 的日志里决策符合预期后，改 `false` 并按「重载方法」重启
+
+接客户端（二选一或都用，**同一把 NewAPI 令牌**）：
+
+- opencode：provider 的 `baseURL` 改 `http://127.0.0.1:3000/v1`（见「接入要点」3）
+- Claude Code：`ANTHROPIC_BASE_URL=http://127.0.0.1:3000` + `ANTHROPIC_AUTH_TOKEN=<同一把令牌>`（见「接入要点」4）
+
+### 附：改 new-api 用户余额（如补到 2 亿）
+
+**new-api 管理面没有「调余额」的 API**：`PUT /api/user/` 的字段白名单里没有 quota，改不动还回 `success=true`（假成功）。唯一路径是直写 SQLite + 重启：
+
+```bash
+# 换算：quota = 期望显示余额 × QuotaPerUnit(500000)；2 亿 → 2e8 × 5e5 = 1e14
+sqlite3 .newapi/one-api.db "UPDATE users SET quota=100000000000000 WHERE id=1;"
+
+# 两个重启缺一不可：
+./target/release/quota-throttle down config.toml          # ① 停 new-api：用户缓存要靠重启才失效
+launchctl kickstart -k gui/$(id -u)/com.quota-throttle    # ② 重启本工具：它重新拉起 new-api 并重登
+```
+
+⚠️ 第 ② 步不是可选项：**new-api 重启会作废本工具的管理会话**，而客户端暂不会在 401 后自动重登——不重启本工具，之后看板读数全空、priority 下发全失败（决策本身不坏：已下发的 priority 在 new-api 落了库）。
+
 ## Key 配置与重载（日常操作）
 
 **没有热加载**：`config.toml` 只在启动时读一次，改完必须重启循环。看板上的加/删 key 是例外（走运行时命令通道，自动写回 config，不用重启）。

@@ -268,6 +268,8 @@ async fn refresh_relays(state: &ProxyState, force: bool) {
 /// · **403**（渠道被禁用/自动封禁——渠道级可修；另一义「用户额度不足」是 user 级、
 ///   换渠道无用，重试两次的浪费上限可接受，F3 已把该情形压到近零）
 /// · 不重试 400/404/422（请求本身错）、401（令牌问题——走令牌自愈路径，不换渠道）
+/// · 400 里唯一的渠道级含义「指定渠道已不存在」（distributor.go:47-52）不进矩阵：由
+///   `RouteView::from_snap` 按面板 channels 表在**选路前**把不存在/禁用的渠道剔掉（review M2）
 fn retryable(code: u16) -> bool {
     matches!(code, 403 | 429 | 500 | 502 | 503 | 504)
 }
@@ -446,14 +448,16 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
                     affinity = None;
                     continue;
                 }
-                // —— 评分阶段：用尽交回，否则立即换下一个 ——
+                // —— 评分阶段：**先留住这次响应**再决定换不换——候选中途耗尽（NoEligible）
+                //    时要把它原样交回客户端。旧代码只在预算打满时才存、其余分支排干丢弃，
+                //    合格渠道 < 3 把的部署在全员限速时拿到的是合成 502 而非上游 429
+                //    （review H1）。不再排干：这条连接不回池，重试路径上可忽略。
+                debug!(channel = id, status = resp.status().as_u16(), "可重试响应，换渠道");
+                final_resp = Some(resp);
+                tried.push(id);
                 if score_sends >= SCORE_SENDS {
-                    final_resp = Some(resp);
                     break;
                 }
-                debug!(channel = id, status = resp.status().as_u16(), "可重试响应，换渠道");
-                let _ = tokio::time::timeout(Duration::from_secs(10), resp.bytes()).await;
-                tried.push(id);
             }
             Ok(resp) if resp.status().as_u16() == 401 => {
                 // 401 = 中继令牌问题（渠道无关）——触发令牌刷新自愈（review #1），
@@ -465,9 +469,17 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
                 return upstream_to_response(resp);
             }
             Ok(resp) => {
-                state.router.record(key, id); // 成功即归属（命中渠道恢复=原渠道不变；换道成功=迁到新渠道）
+                // 只有 2xx 才归属（命中渠道恢复=原渠道不变；换道成功=迁到新渠道）。
+                // 400/404/422 等非重试码原样交回但**不记池**——否则渠道级的非重试错误
+                // （如 rc.20 distributor 对「指定渠道已不存在」回的 400）会把对话钉死在
+                // 坏渠道上（review M2；渠道存在性另在 RouteView::from_snap 过滤）
+                if resp.status().is_success() {
+                    state.router.record(key, id);
+                    debug!(channel = id, via = ?via, "已路由");
+                } else {
+                    debug!(channel = id, via = ?via, status = resp.status().as_u16(), "非重试错误，原样交回（不记池）");
+                }
                 publish_stats(state).await;
-                debug!(channel = id, via = ?via, "已路由");
                 return upstream_to_response(resp);
             }
             Err(e) => {
@@ -678,6 +690,56 @@ mod tests {
         }
     }
 
+    /// 读完整个 HTTP/1.1 请求（头 + Content-Length 体）再回包。
+    /// 旧 mock 单次 read 只拿到头就回包、关连接：客户端可能还在写体 → RST → 被当成连接错误
+    /// 换道；响应又没带 Connection: close，reqwest 复用已关连接再撞一次——两者叠加让
+    /// 4 个用例 ~30% 概率随机挂（review：flaky）。
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = sock.read(&mut tmp).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                let content_length = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= pos + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    /// mock 响应：短连接（Connection: close），让 reqwest 每个请求都新建连接
+    fn mock_response(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// 从请求文本里取 Authorization 行（mock 据此区分渠道）
+    fn auth_line(req: &str) -> String {
+        req.lines()
+            .find(|l| l.to_lowercase().starts_with("authorization:"))
+            .unwrap_or_default()
+            .to_string()
+    }
+
     /// 冒烟集成测试：mock 上游（裸 TcpListener 回固定响应）+ 代理 → 客户端经代理拿到
     /// 响应；同时验证请求头透传与 hop-by-hop 剥离（Connection 不该到上游）。
     #[tokio::test]
@@ -686,13 +748,12 @@ mod tests {
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         let upstream_task = tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::io::AsyncWriteExt;
             let (mut sock, _) = upstream.accept().await.unwrap();
-            let mut buf = vec![0u8; 8192];
-            let n = sock.read(&mut buf).await.unwrap();
-            let req_text = String::from_utf8_lossy(&buf[..n]).to_string();
-            let resp = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\n\r\nhello";
-            sock.write_all(resp.as_bytes()).await.unwrap();
+            let req_text = read_request(&mut sock).await;
+            sock.write_all(mock_response("200 OK", "hello").as_bytes())
+                .await
+                .unwrap();
             req_text
         });
 
@@ -751,25 +812,18 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen_c = seen.clone();
         tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             loop {
                 let Ok((mut sock, _)) = upstream.accept().await else { break };
                 let seen_c = seen_c.clone();
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 16384];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let auth = req
-                        .lines()
-                        .find(|l| l.to_lowercase().starts_with("authorization:"))
-                        .unwrap_or_default()
-                        .to_string();
+                    use tokio::io::AsyncWriteExt;
+                    let auth = auth_line(&read_request(&mut sock).await);
                     seen_c.lock().unwrap().push(auth.clone());
                     // 渠道后缀 -1 → 429；-2 → 200（模拟一把烧尽的 key 和一把有余量的）
                     let resp = if auth.ends_with("-1") {
-                        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\n\r\n"
+                        mock_response("429 Too Many Requests", "")
                     } else {
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\nok"
+                        mock_response("200 OK", "ok")
                     };
                     sock.write_all(resp.as_bytes()).await.ok();
                 });
@@ -847,16 +901,13 @@ mod tests {
                 let seen_c = seen.clone();
                 let ch1_c = ch1_429ed.clone();
                 tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 16384];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let auth = req.lines().find(|l| l.to_lowercase().starts_with("authorization:")).unwrap_or_default().to_string();
+                    use tokio::io::AsyncWriteExt;
+                    let auth = auth_line(&read_request(&mut sock).await);
                     seen_c.lock().unwrap().push(auth.clone());
                     let resp = if auth.ends_with("-1") && !ch1_c.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\n\r\n"
+                        mock_response("429 Too Many Requests", "")
                     } else {
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\nok"
+                        mock_response("200 OK", "ok")
                     };
                     sock.write_all(resp.as_bytes()).await.ok();
                 });
@@ -908,17 +959,14 @@ mod tests {
                 let Ok((mut sock, _)) = upstream.accept().await else { break };
                 let seen = seen.clone();
                 tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 16384];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let auth = req.lines().find(|l| l.to_lowercase().starts_with("authorization:")).unwrap_or_default().to_string();
+                    use tokio::io::AsyncWriteExt;
+                    let auth = auth_line(&read_request(&mut sock).await);
                     seen.lock().unwrap().push(auth.clone());
                     // -1 恒 429；-2 恒 200
                     let resp = if auth.ends_with("-1") {
-                        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\n\r\n"
+                        mock_response("429 Too Many Requests", "")
                     } else {
-                        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"
+                        mock_response("200 OK", "ok")
                     };
                     sock.write_all(resp.as_bytes()).await.ok();
                 });
@@ -970,18 +1018,15 @@ mod tests {
                 let Ok((mut sock, _)) = upstream.accept().await else { break };
                 let seen = seen.clone();
                 tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 16384];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let auth = req.lines().find(|l| l.to_lowercase().starts_with("authorization:")).unwrap_or_default().to_string();
+                    use tokio::io::AsyncWriteExt;
+                    let auth = auth_line(&read_request(&mut sock).await);
                     let is_relay = auth.contains("Bearer sk-testtokenopenai");
                     seen.lock().unwrap().push(auth);
                     // 中继请求恒 429；客户端 token 的透传请求恒 200（若被透传会被发现）
                     let resp = if is_relay {
-                        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\n\r\n"
+                        mock_response("429 Too Many Requests", "")
                     } else {
-                        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"
+                        mock_response("200 OK", "ok")
                     };
                     sock.write_all(resp.as_bytes()).await.ok();
                 });
@@ -1030,5 +1075,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 401);
+    }
+
+    /// 两把合格渠道的快照 + 恒定回包的 mock 上游（每个请求新连接）
+    async fn two_channel_fixture(
+        respond: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (ProxyState, u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_c = seen.clone();
+        let respond = Arc::new(respond);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else { break };
+                let seen_c = seen_c.clone();
+                let respond = respond.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let auth = auth_line(&read_request(&mut sock).await);
+                    seen_c.lock().unwrap().push(auth.clone());
+                    sock.write_all(respond(&auth).as_bytes()).await.ok();
+                });
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let state = test_state(format!("http://{upstream_addr}"), Some(relays()));
+        crate::status::update(&state.snapshot, |s| {
+            s.eligible = vec![1, 2];
+            s.keys = vec![
+                crate::status::KeyStatus { channel_id: 1, five_hour_pct: Some(10.0), weekly_pct: Some(10.0), max_pct: Some(10.0), ..Default::default() },
+                crate::status::KeyStatus { channel_id: 2, five_hour_pct: Some(20.0), weekly_pct: Some(20.0), max_pct: Some(20.0), ..Default::default() },
+            ];
+        });
+        tokio::spawn(serve_on(state.clone(), listener));
+        (state, proxy_port, seen)
+    }
+
+    /// review H1 回归：**无缓存命中 + 合格渠道 < 3 把**、全员 429 → 交回上游 429（含原始体），
+    /// 而不是合成 502（旧代码评分阶段排干丢弃响应，候选耗尽时 final_resp 为空）
+    #[tokio::test]
+    async fn 无命中_两渠道全429_交回上游429而非502() {
+        let (state, proxy_port, seen) =
+            two_channel_fixture(|_| mock_response("429 Too Many Requests", r#"{"error":"limit"}"#)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
+            .header("authorization", "Bearer client")
+            .body(br#"{"model":"m","messages":[{"role":"user","content":"fresh-conv"}]}"#.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 429, "候选耗尽应交回上游 429，不合成 502");
+        assert_eq!(resp.text().await.unwrap(), r#"{"error":"limit"}"#, "上游响应体应原样交回");
+        let auths = seen.lock().unwrap().clone();
+        assert_eq!(auths.len(), 2, "两把各试一次后候选耗尽：{auths:?}");
+        assert!(auths.iter().all(|a| a.contains("sk-testtokenopenai")), "不应出现客户端 token 透传：{auths:?}");
+        assert_eq!(state.router.stats().entries, 0, "失败不记池");
+    }
+
+    /// review M2 回归：非重试的非 2xx（400/404 等）原样交回但**不记池**、不换道——
+    /// 否则渠道级的非重试错误会把对话钉死在坏渠道上
+    #[tokio::test]
+    async fn 非重试错误_原样交回_不记池不换道() {
+        let (state, proxy_port, seen) =
+            two_channel_fixture(|_| mock_response("404 Not Found", r#"{"error":"no such model"}"#)).await;
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
+            .header("authorization", "Bearer client")
+            .body(br#"{"model":"m","messages":[{"role":"user","content":"conv-404"}]}"#.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        assert_eq!(seen.lock().unwrap().len(), 1, "非重试码不换道");
+        assert_eq!(state.router.stats().entries, 0, "404 不应写入缓存池");
     }
 }

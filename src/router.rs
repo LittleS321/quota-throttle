@@ -45,10 +45,27 @@ pub struct KeyQuota {
 }
 
 impl RouteView {
-    /// 在读锁内提取（锁外不做任何事——面板循环 5s 一刷，不能被路由读拖住）
+    /// 在读锁内提取（锁外不做任何事——面板循环 5s 一刷，不能被路由读拖住）。
+    ///
+    /// **渠道存在性过滤（review M2）**：合格集来自探针（智谱额度），对 new-api 侧「渠道还在
+    /// 不在、有没有被禁用」一无所知。渠道被外删后探针照常合格、评分照常选它，而 rc.20 对
+    /// 「指定渠道不存在」回 **400**（非重试码）——对话钉死、评分最高时新对话全部撞 400。
+    /// 面板 5s 刷新的 `channels` 表是唯一能看见渠道实况的数据源：在这里把不存在/已禁用的
+    /// 渠道从代理视图剔掉（禁用渠道 distributor 必回 403，剔掉省一次无谓发送）。
+    /// `channels` 为空（面板拉取失败/刚启动）时不过滤，退回探针合格集。
     pub fn from_snap(snap: &RwLockReadGuard<'_, StatusSnapshot>) -> Self {
+        let live: Option<std::collections::HashSet<i64>> = if snap.channels.is_empty() {
+            None
+        } else {
+            Some(snap.channels.iter().filter(|c| c.enabled).map(|c| c.id).collect())
+        };
         Self {
-            eligible: snap.eligible.clone(),
+            eligible: snap
+                .eligible
+                .iter()
+                .copied()
+                .filter(|id| live.as_ref().is_none_or(|s| s.contains(id)))
+                .collect(),
             pinned: snap.pinned_channel_id,
             keys: snap
                 .keys
@@ -1201,5 +1218,42 @@ mod tests {
         assert_eq!(v.pinned, Some(3));
         assert_eq!(v.keys.get(&3).unwrap().weekly_reset_ms, Some(123));
         assert!(v.has_data);
+    }
+
+    /// review M2：代理视图按 new-api 渠道实况过滤——不存在/已禁用的渠道不进合格集；
+    /// channels 表为空（面板未取到）时不过滤，退回探针合格集
+    #[test]
+    fn 快照提取_按渠道存在性与启用状态过滤() {
+        let ch = |id: i64, enabled: bool| crate::status::ChannelState {
+            id,
+            name: format!("c{id}"),
+            enabled,
+            status_raw: if enabled { 1 } else { 2 },
+            priority: None,
+            weight: None,
+            used_quota: 0,
+            auto_ban: None,
+            models: String::new(),
+            group: String::new(),
+        };
+        // 渠道 1 在且启用；2 在但禁用；3 已被外删（不在表里）
+        let snap = StatusSnapshot {
+            eligible: vec![1, 2, 3],
+            channels: vec![ch(1, true), ch(2, false)],
+            ..Default::default()
+        };
+        let lock = std::sync::RwLock::new(snap);
+        assert_eq!(RouteView::from_snap(&lock.read().unwrap()).eligible, vec![1]);
+
+        let snap2 = StatusSnapshot {
+            eligible: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let lock2 = std::sync::RwLock::new(snap2);
+        assert_eq!(
+            RouteView::from_snap(&lock2.read().unwrap()).eligible,
+            vec![1, 2, 3],
+            "channels 表为空时不过滤"
+        );
     }
 }

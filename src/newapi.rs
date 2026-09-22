@@ -53,6 +53,10 @@ enum Auth {
 struct AuthState {
     auth: Auth,
     last_login_attempt: Option<tokio::time::Instant>,
+    /// 会话代次：每次登录成功 +1。send_authed 拿着发请求时的代次判断「401 之后是否已有
+    /// 别的调用重登过」——是则直接用新会话重试，不再登录、也不受冷却限制
+    /// （review H2：旧逻辑让并发 401 的「输家」在冷却期拿到裸 401）。
+    generation: u64,
 }
 
 /// 建渠道参数：两种格式模板（OpenAI/Anthropic）归一到同一 payload 形状。
@@ -224,6 +228,7 @@ impl NewApiClient {
             auth: Arc::new(tokio::sync::Mutex::new(AuthState {
                 auth,
                 last_login_attempt: None,
+                generation: 0,
             })),
             root_username: cfg.root_username.clone(),
             root_password: cfg.root_password.clone(),
@@ -257,36 +262,50 @@ impl NewApiClient {
     /// 统一的管理 API 请求入口：带鉴权头发送；**Session 模式遇 401 自动重登一次并重试**
     /// （new-api 重启会作废会话，此路径让面板与 priority 下发自愈）。
     /// make 闭包按鉴权快照构造请求——重试时用新快照重建（RequestBuilder 一次性）。
-    /// Token 模式 401 = admin_token 配置错误，重试无意义，原样透传由调用方报错。
+    ///
+    /// **401 恢复不了就报错，绝不把 401 响应当正常响应返回**（review H2）：401 体
+    /// `{"success":false}` 是合法 JSON，读接口会把它解析成「空列表/空集」——面板全空，
+    /// 更糟的是 deprecate 的「渠道是否还在」判定会把空列表误读成「已被外删」而放行弃用。
+    /// Token 模式 401 = admin_token 配置错误，重试无意义，同样报错。
     async fn send_authed<F>(&self, ctx: &str, make: F) -> Result<reqwest::Response>
     where
         F: Fn(&Auth) -> reqwest::RequestBuilder,
     {
         // reqwest 0.11 的 send() future 是 'static，ctx 需 owned 才能 accompany await
         let ctx = ctx.to_string();
-        let snapshot = self.auth.lock().await.auth.clone();
+        let (snapshot, seen_gen) = {
+            let g = self.auth.lock().await;
+            (g.auth.clone(), g.generation)
+        };
         let resp = make(&snapshot).send().await.context(ctx.clone())?;
         if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(resp);
         }
-        let session_mode = matches!(snapshot, Auth::Session { .. });
-        if session_mode && self.try_relogin().await.is_ok() {
-            info!("管理会话失效（401），已自动重登并重试");
-            let fresh = self.auth.lock().await.auth.clone();
-            return Ok(make(&fresh).send().await.context(ctx)?);
+        if !matches!(snapshot, Auth::Session { .. }) {
+            bail!("{ctx}: HTTP 401（admin_token 无效或已失效，请检查配置）");
         }
-        Ok(resp)
+        if let Err(e) = self.try_relogin(seen_gen).await {
+            bail!("{ctx}: HTTP 401（管理会话失效，重登未成功：{e}）");
+        }
+        let fresh = self.auth.lock().await.auth.clone();
+        make(&fresh).send().await.context(ctx)
     }
 
-    /// 会话失效后的原地重登（持有 auth 锁进行）。带 10s 尝试冷却，理由见 AuthState。
-    async fn try_relogin(&self) -> Result<()> {
+    /// 会话失效后的重登。`seen_gen` = 调用方发请求时的会话代次：此刻代次已变（别的调用
+    /// 刚重登成功）→ 直接 Ok 让调用方用新会话重试，不再登录、不受冷却限制；否则带 10s
+    /// 尝试冷却真正登录（冷却理由见 AuthState）。
+    async fn try_relogin(&self, seen_gen: u64) -> Result<()> {
         let mut guard = self.auth.lock().await;
+        if guard.generation != seen_gen {
+            return Ok(()); // 别人已重登过，新会话可用
+        }
         if let Some(at) = guard.last_login_attempt {
             if at.elapsed() < tokio::time::Duration::from_secs(10) {
                 bail!("会话失效且 10 秒内已尝试过重登（冷却中；若持续失败请检查 root 密码）");
             }
         }
         guard.last_login_attempt = Some(tokio::time::Instant::now());
+        info!("管理会话失效（401），自动重登");
         self.do_login(&mut guard).await
     }
 
@@ -317,6 +336,7 @@ impl NewApiClient {
             .and_then(|v| v.as_i64());
         info!(user_id = ?user_id, "已登录 new-api（会话模式）");
         state.auth = Auth::Session { user_id };
+        state.generation += 1;
         Ok(())
     }
 
@@ -403,6 +423,33 @@ impl NewApiClient {
             }
         }
         Ok(map)
+    }
+
+    /// 建渠道后按名解析它的 id（rc.20 AddChannel 只回 success，不回 id，只能再列一遍）。
+    /// 列表失败——限流 429 的非 JSON 体、网络抖动——用短退避重试 3 次：一次瞬时失败就
+    /// 放弃会留下「渠道已建、config 未落」的撕裂态，恢复流程下次启动对齐还会把它当弃用
+    /// 残留删掉（review M1）。
+    pub async fn resolve_channel_id_by_name(&self, name: &str) -> Result<i64> {
+        let mut last_err: Option<anyhow::Error> = None;
+        for (attempt, delay_ms) in [0u64, 1_000, 3_000].into_iter().enumerate() {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            match self.list_channels().await {
+                Ok(m) => match m.get(name) {
+                    Some(&id) => return Ok(id),
+                    None => {
+                        last_err = Some(anyhow::anyhow!("渠道列表里没有 {name}（第 {} 次）", attempt + 1))
+                    }
+                },
+                Err(e) => {
+                    warn!(name = %name, attempt = attempt + 1, error = %e, "建渠道后按名解析 id 失败，稍后重试");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("未知错误")))
+            .with_context(|| format!("按名解析渠道 {name} 的 id 失败（已重试 3 次）"))
     }
 
     /// 【看板】拉取渠道**完整状态**（status / priority / weight / used_quota / auto_ban）。

@@ -551,11 +551,17 @@ impl Orchestrator {
             )
             .await
             .map_err(|e| format!("建渠道失败：{e}"))?;
-        let channels = self.api.list_channels().await.ok();
-        let channel_id = channels
-            .as_ref()
-            .and_then(|m| m.get(&name).copied())
-            .ok_or_else(|| format!("渠道已建好，但在 new-api 里解析不到它的 id：{name}"))?;
+        // 带重试的按名解析（review M1）；仍失败则明说 config 没写、渠道已建，给出清理路径
+        let channel_id = self
+            .api
+            .resolve_channel_id_by_name(&name)
+            .await
+            .map_err(|e| {
+                format!(
+                    "渠道已建好，但取不到它的 id：{e}。config.toml **未写入**——请到 new-api \
+                     删掉刚建的渠道 {name} 后重试（否则再次添加会出现同名双渠道）"
+                )
+            })?;
 
         // ③ 写回 config.toml（唯一数据源 ⇒ 重启后仍在）
         if let Err(e) = crate::config::append_key(&self.cfg.source_path, &spec) {
@@ -626,12 +632,14 @@ impl Orchestrator {
                 .set_channel_priority(id, self.cfg.priority_exhausted)
                 .await
             {
+                // 查不动 **或列表为空** 都保守按「还在」处理（保持硬失败闸门）：我们至少
+                // 管着 2 把 key，空列表只可能是拉取异常，不是「渠道真没了」的证据（review H2）
                 let still_exists = self
                     .api
                     .list_channels()
                     .await
-                    .map(|m| m.values().any(|&v| v == id))
-                    .unwrap_or(true); // 查不动时保守按「还在」处理（保持硬失败闸门）
+                    .map(|m| m.is_empty() || m.values().any(|&v| v == id))
+                    .unwrap_or(true);
                 if still_exists {
                     return Err(format!(
                         "把 {} 的 priority 压到最低失败，未做任何改动：{e}",
@@ -728,11 +736,19 @@ impl Orchestrator {
             )
             .await
             .map_err(|e| format!("重建渠道失败：{e}"))?;
-        let channels = self.api.list_channels().await.ok();
-        let channel_id = channels
-            .as_ref()
-            .and_then(|m| m.get(name).copied())
-            .ok_or_else(|| format!("渠道已建好，但在 new-api 里解析不到它的 id：{name}"))?;
+        // 带重试的按名解析（review M1）。仍失败：config 仍是弃用态，而渠道已建——不明说的话
+        // 下次启动对齐会把它当弃用残留删掉，用户以为恢复过了其实被静默回滚。
+        // 再点一次「恢复」即自愈（步骤 ② 会先删残留再重建）。
+        let channel_id = self
+            .api
+            .resolve_channel_id_by_name(name)
+            .await
+            .map_err(|e| {
+                format!(
+                    "渠道已建好，但取不到它的 id：{e}。config.toml 里 {name} **仍是弃用状态**——\
+                     请稍后再点一次「恢复」（会先删掉这次的残留渠道再重建）"
+                )
+            })?;
 
         // ④ config：单次原子写——去标志 + 落新 channel_id（活跃 key 持有 id 的统一规则）
         crate::config::restore_key(&self.cfg.source_path, name, channel_id)

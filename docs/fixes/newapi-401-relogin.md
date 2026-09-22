@@ -37,8 +37,13 @@
    struct AuthState { auth: Auth, last_login_attempt: Option<tokio::time::Instant> }
    ```
 2. 新增私有 `send_authed(&self, ctx: &str, make: impl Fn() -> reqwest::RequestBuilder) -> Result<reqwest::Response>`：
-   - `make().send()` → 若 HTTP 状态 == 401 且当前为 Session 模式 → `try_relogin()` 成功则 `make()` **重建请求**再发一次（RequestBuilder 一次性，须闭包重建；失败/冷却中则原样返回 401 响应，由调用方按现状报错）。
-   - Token 模式 401 → 不重登（配置错误，重试无意义），直接透传响应。
+   - `make().send()` → 若 HTTP 状态 == 401 且当前为 Session 模式 → `try_relogin()` 成功则 `make()` **重建请求**再发一次（RequestBuilder 一次性，须闭包重建）。
+   - ~~失败/冷却中则原样返回 401 响应，由调用方按现状报错~~ **（2026-09-22 修正，见
+     `proxy-newapi-lifecycle-fix-pr1-review.md` H2）**：失败/冷却中 → **`bail!` 报错**。原样返回
+     401 响应是个错误——401 体 `{"success":false}` 是合法 JSON，读接口会把它解析成空集
+     （面板 channels=0 / quota=-1 正是本修复要消除的症状），`deprecate_key` 的「渠道是否还在」
+     判定更会把空列表误读成「已被外删」而放行弃用。
+   - Token 模式 401 → 不重登（配置错误，重试无意义），同样 `bail!`。
 3. `try_relogin(&self)`：锁内双检——`last_login_attempt` 距今 **< 10s** → bail（防 CriticalRateLimit 烧穿；首个失败后 10s 内的其它 401 调用直接报错，与现状一致）；否则记录时刻 → `do_login()`（登录请求本身不经 send_authed）→ 更新 `auth = Session{user_id}`（reqwest cookie_store 自动换新 cookie）。
 4. `do_login()` 从现 `authenticate()` 主体抽出复用；`authenticate(&self)`：锁内 `Pending` 才（`ensure_setup` 后）`do_login`，幂等语义不变。
 5. 全部带鉴权的管理调用（list_channels / list_channel_states / recent_logs / usage_data / user_quota / get_channel / set_channel_field 内的 GET+PUT / sync_channels 链 / 未来 F1 新增方法）改走 `send_authed`；`ensure_setup` / `do_login` 本身不走（无需鉴权）。
@@ -58,7 +63,10 @@
 - **无回归引入**：
   - 正常路径（200）行为逐字节等价：send_authed 只是包了一层「状态码判断」，不改变请求构造与解析；
   - Token 模式（admin_token）完全不受影响（401 不触发重登）；
-  - 并发：多个 task 共享 `Arc<NewApiClient>` 同时 401 → 锁串行化重登，10s 冷却保证最多一次/10s；
+  - 并发：多个 task 共享 `Arc<NewApiClient>` 同时 401 → 锁串行化重登，10s 冷却保证最多一次/10s。
+    **（2026-09-22 补）**输家不能只靠冷却 bail：`AuthState.generation` 每次登录成功 +1，
+    `send_authed` 记下发请求时的代次，401 后发现代次已变 ⇒ 别人已重登 ⇒ 直接用新会话重试，
+    不登录也不吃冷却；代次未变才走冷却 + 登录；
   - 新风险（login 限流烧穿）已由冷却防护，见第六部分用例 5。
 - **锁与 await**：`tokio::sync::Mutex`（临界区含登录 `.await`，不能用 std Mutex）；`apply_headers` 只做快照不长期持锁，无死锁面（单锁无序问题）。
 
